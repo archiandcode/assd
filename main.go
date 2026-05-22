@@ -2,16 +2,20 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"embed"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html/template"
@@ -41,6 +45,7 @@ const (
 	defaultDBURL    = "host=/tmp/url-generator-postgres port=5432 user=url_generator password=url_generator_password dbname=url_generator sslmode=disable"
 	sessionCookie   = "url_generator_session"
 	passwordIters   = 210000
+	publicIDLength  = 5
 )
 
 var (
@@ -49,6 +54,7 @@ var (
 	sessions = sessionStore{values: map[string]time.Time{}}
 	authDB   *sql.DB
 	logins   = newLoginLimiter(5, 10*time.Minute)
+	idMu     sync.Mutex
 )
 
 type fileMeta struct {
@@ -76,6 +82,7 @@ type pageData struct {
 type uploadLink struct {
 	Name string
 	URL  string
+	ID   string
 }
 
 type uploadedFile struct {
@@ -210,6 +217,7 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 					{{else if eq .Active "uploaded"}}
 						<header class="page-header">
 							<h1>Загруженные</h1>
+							<button class="btn btn-primary" type="button" data-export-xlsx>Выгрузить XLSX</button>
 						</header>
 
 						{{if .Files}}
@@ -245,6 +253,7 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 			</div>
 		{{end}}
 	</main>
+	<script src="/assets/export.js"></script>
 </body>
 </html>`))
 
@@ -265,6 +274,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", route)
 	mux.HandleFunc("/assets/styles.css", styles)
+	mux.HandleFunc("/assets/export.js", exportScript)
 
 	addr := listenAddr()
 	log.Printf("listening on http://localhost%s", addr)
@@ -293,6 +303,11 @@ func route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		renderUploaded(w, r)
+	case isReadMethod(r.Method) && r.URL.Path == "/ws/uploads.xlsx":
+		if !requireAuth(w, r) {
+			return
+		}
+		exportUploadsXLSX(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/upload":
 		if !requireAuth(w, r) {
 			return
@@ -413,6 +428,7 @@ func upload(w http.ResponseWriter, r *http.Request) {
 			uploads = append(uploads, uploadLink{
 				Name: meta.OriginalName,
 				URL:  publicURL(r, meta),
+				ID:   meta.ID,
 			})
 		}
 	}
@@ -486,7 +502,10 @@ func savePDF(name string, src io.Reader) (fileMeta, error) {
 		return meta, fmt.Errorf("not pdf")
 	}
 
-	id, err := newSlug(name)
+	idMu.Lock()
+	defer idMu.Unlock()
+
+	id, err := newPublicID()
 	if err != nil {
 		return meta, err
 	}
@@ -642,6 +661,33 @@ func renderUploaded(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func exportUploadsXLSX(w http.ResponseWriter, r *http.Request) {
+	conn, err := acceptWebSocket(w, r)
+	if err != nil {
+		return
+	}
+	defer conn.close()
+
+	metas, err := loadAllMeta()
+	if err != nil {
+		_ = conn.writeClose("cannot load files")
+		return
+	}
+	sort.Slice(metas, func(i, j int) bool {
+		return nameWithoutPDF(metas[i].OriginalName) < nameWithoutPDF(metas[j].OriginalName)
+	})
+
+	xlsx, err := buildUploadsXLSX(metas)
+	if err != nil {
+		_ = conn.writeClose("cannot build xlsx")
+		return
+	}
+	if err := conn.writeBinary(xlsx); err != nil {
+		return
+	}
+	_ = conn.writeClose("")
+}
+
 func render(w http.ResponseWriter, data pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := page.Execute(w, data); err != nil {
@@ -700,15 +746,11 @@ func loadAllMeta() ([]fileMeta, error) {
 	return metas, nil
 }
 
-func newSlug(name string) (string, error) {
-	base := slugFileName(name)
-	ext := filepath.Ext(base)
-	stem := strings.TrimSuffix(base, ext)
-
+func newPublicID() (string, error) {
 	for i := 0; i < 1000; i++ {
-		id := base
-		if i > 0 {
-			id = fmt.Sprintf("%s-%d%s", stem, i+1, ext)
+		id, err := randomPublicID()
+		if err != nil {
+			return "", err
 		}
 		if _, err := os.Stat(filepath.Join(metaDir, id+".json")); errors.Is(err, os.ErrNotExist) {
 			return id, nil
@@ -719,16 +761,17 @@ func newSlug(name string) (string, error) {
 	return "", fmt.Errorf("cannot allocate public URL for file")
 }
 
-func slugFileName(name string) string {
-	name = sanitizeFileName(name)
-	ext := strings.ToLower(filepath.Ext(name))
-	if ext != ".pdf" {
-		name = strings.TrimSuffix(name, filepath.Ext(name)) + ".pdf"
+func randomPublicID() (string, error) {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	var b [publicIDLength]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
 	}
-	if name == ".pdf" {
-		return "document.pdf"
+	id := make([]byte, publicIDLength)
+	for i, n := range b {
+		id[i] = alphabet[int(n)%len(alphabet)]
 	}
-	return name
+	return string(id), nil
 }
 
 func sanitizeFileName(name string) string {
@@ -775,6 +818,11 @@ func styles(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(css))
 }
 
+func exportScript(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	_, _ = w.Write([]byte(js))
+}
+
 func must(err error) {
 	if err != nil {
 		log.Fatal(err)
@@ -803,7 +851,7 @@ func isAuthenticated(r *http.Request) bool {
 
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'self'; object-src 'none'; frame-src 'self'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws: wss:; base-uri 'self'; object-src 'none'; frame-src 'self'; form-action 'self'")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -1156,6 +1204,212 @@ func formatBytes(size int64) string {
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(size)/float64(div), "KMGTPE"[exp])
 }
+
+type webSocketConn struct {
+	conn net.Conn
+	rw   *bufio.ReadWriter
+}
+
+func acceptWebSocket(w http.ResponseWriter, r *http.Request) (*webSocketConn, error) {
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") ||
+		!strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+		http.Error(w, "websocket upgrade required", http.StatusBadRequest)
+		return nil, fmt.Errorf("not websocket")
+	}
+
+	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
+	if key == "" {
+		http.Error(w, "missing websocket key", http.StatusBadRequest)
+		return nil, fmt.Errorf("missing websocket key")
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "websocket not supported", http.StatusInternalServerError)
+		return nil, fmt.Errorf("hijack not supported")
+	}
+
+	conn, rw, err := hijacker.Hijack()
+	if err != nil {
+		return nil, err
+	}
+
+	accept := webSocketAccept(key)
+	if _, err := fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if err := rw.Flush(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	return &webSocketConn{conn: conn, rw: rw}, nil
+}
+
+func webSocketAccept(key string) string {
+	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func (c *webSocketConn) writeBinary(data []byte) error {
+	return c.writeFrame(0x2, data)
+}
+
+func (c *webSocketConn) writeClose(reason string) error {
+	payload := []byte{0x03, 0xe8}
+	if reason != "" {
+		payload = append(payload, []byte(reason)...)
+	}
+	return c.writeFrame(0x8, payload)
+}
+
+func (c *webSocketConn) writeFrame(opcode byte, payload []byte) error {
+	header := []byte{0x80 | opcode}
+	switch {
+	case len(payload) < 126:
+		header = append(header, byte(len(payload)))
+	case len(payload) <= 65535:
+		header = append(header, 126, byte(len(payload)>>8), byte(len(payload)))
+	default:
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(payload)))
+		header = append(header, 127)
+		header = append(header, size[:]...)
+	}
+	if _, err := c.rw.Write(header); err != nil {
+		return err
+	}
+	if _, err := c.rw.Write(payload); err != nil {
+		return err
+	}
+	return c.rw.Flush()
+}
+
+func (c *webSocketConn) close() {
+	_ = c.conn.Close()
+}
+
+func buildUploadsXLSX(metas []fileMeta) ([]byte, error) {
+	var out bytes.Buffer
+	zw := zip.NewWriter(&out)
+
+	files := map[string]string{
+		"[Content_Types].xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+	<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+	<Default Extension="xml" ContentType="application/xml"/>
+	<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+	<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>`,
+		"_rels/.rels": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+	<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`,
+		"xl/workbook.xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+	<sheets><sheet name="uploads" sheetId="1" r:id="rId1"/></sheets>
+</workbook>`,
+		"xl/_rels/workbook.xml.rels": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+	<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>`,
+		"xl/worksheets/sheet1.xml": buildWorksheetXML(metas),
+	}
+
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		w, err := zw.Create(name)
+		if err != nil {
+			zw.Close()
+			return nil, err
+		}
+		if _, err := io.WriteString(w, files[name]); err != nil {
+			zw.Close()
+			return nil, err
+		}
+	}
+
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func buildWorksheetXML(metas []fileMeta) string {
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
+	b.WriteString(`<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>`)
+	for i, meta := range metas {
+		row := i + 1
+		b.WriteString(fmt.Sprintf(`<row r="%d">`, row))
+		writeInlineCell(&b, "A", row, nameWithoutPDF(meta.OriginalName))
+		writeInlineCell(&b, "B", row, meta.ID)
+		b.WriteString(`</row>`)
+	}
+	b.WriteString(`</sheetData></worksheet>`)
+	return b.String()
+}
+
+func nameWithoutPDF(name string) string {
+	if strings.EqualFold(filepath.Ext(name), ".pdf") {
+		return strings.TrimSuffix(name, filepath.Ext(name))
+	}
+	return name
+}
+
+func writeInlineCell(b *strings.Builder, col string, row int, value string) {
+	b.WriteString(fmt.Sprintf(`<c r="%s%d" t="inlineStr"><is><t>`, col, row))
+	_ = xml.EscapeText(b, []byte(value))
+	b.WriteString(`</t></is></c>`)
+}
+
+const js = `(() => {
+    const button = document.querySelector("[data-export-xlsx]");
+    if (!button) {
+        return;
+    }
+
+    button.addEventListener("click", () => {
+        const originalText = button.textContent;
+        button.disabled = true;
+        button.textContent = "Выгрузка...";
+
+        const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const socket = new WebSocket(scheme + "//" + window.location.host + "/ws/uploads.xlsx");
+        socket.binaryType = "arraybuffer";
+
+        socket.onmessage = (event) => {
+            const blob = new Blob([event.data], {
+                type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.download = "uploads.xlsx";
+            document.body.appendChild(link);
+            link.click();
+            URL.revokeObjectURL(link.href);
+            link.remove();
+            socket.close();
+        };
+
+        socket.onclose = () => {
+            button.disabled = false;
+            button.textContent = originalText;
+        };
+
+        socket.onerror = () => {
+            button.disabled = false;
+            button.textContent = originalText;
+            alert("Не удалось выгрузить XLSX.");
+        };
+    });
+})();`
 
 const css = `:root {
     color-scheme: light;
