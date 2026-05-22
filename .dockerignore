@@ -1,0 +1,11 @@
+.git
+.gitignore
+.agents
+.codex
+.env
+.env.local
+Dockerfile
+docker-compose.yml
+storage
+tmp
+*.log

@@ -1,0 +1,46 @@
+services:
+  app:
+    build: .
+    container_name: url-generator-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: 8010
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    ports:
+      - "${APP_PORT:-8010}:8010"
+    volumes:
+      - app_storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: url-generator-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - /tmp/url-generator-postgres:/var/run/postgresql-host
+    command:
+      - postgres
+      - -c
+      - unix_socket_directories=/var/run/postgresql,/var/run/postgresql-host
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  app_storage:
+  postgres_data:
