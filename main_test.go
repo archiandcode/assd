@@ -46,6 +46,31 @@ func TestBuildUploadsXLSX(t *testing.T) {
 	}
 }
 
+func TestReadXLSXFirstColumn(t *testing.T) {
+	data, err := buildUploadsXLSX([]fileMeta{
+		{ID: "a1b2c", OriginalName: "report.pdf", CreatedAt: time.Now()},
+		{ID: "d4e5f", OriginalName: "invoice.pdf", CreatedAt: time.Now()},
+	})
+	if err != nil {
+		t.Fatalf("buildUploadsXLSX() error = %v", err)
+	}
+
+	names, err := readXLSXFirstColumn(data)
+	if err != nil {
+		t.Fatalf("readXLSXFirstColumn() error = %v", err)
+	}
+
+	want := []string{"report", "invoice"}
+	if len(names) != len(want) {
+		t.Fatalf("readXLSXFirstColumn() length = %d, want %d (%v)", len(names), len(want), names)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("readXLSXFirstColumn()[%d] = %q, want %q", i, names[i], want[i])
+		}
+	}
+}
+
 func readZipFile(t *testing.T, zr *zip.Reader, name string) string {
 	t.Helper()
 

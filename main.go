@@ -39,13 +39,12 @@ import (
 var migrationFiles embed.FS
 
 const (
-	maxPDFBytes     = 25 << 20
-	maxRequestBytes = 100 << 20
 	defaultAddr     = ":8010"
 	defaultDBURL    = "host=/tmp/url-generator-postgres port=5432 user=url_generator password=url_generator_password dbname=url_generator sslmode=disable"
 	sessionCookie   = "url_generator_session"
 	passwordIters   = 210000
 	publicIDLength  = 5
+	maxWebSocketBytes = 100 << 20
 )
 
 var (
@@ -61,6 +60,7 @@ type fileMeta struct {
 	ID           string    `json:"id"`
 	File         string    `json:"file"`
 	OriginalName string    `json:"original_name"`
+	LinkPath     string    `json:"link_path"`
 	Size         int64     `json:"size"`
 	CreatedAt    time.Time `json:"created_at"`
 }
@@ -69,14 +69,19 @@ type pageData struct {
 	Title       string
 	Active      string
 	Error       string
+	Query       string
 	Login       bool
 	Uploads     []uploadLink
 	Files       []uploadedFile
 	FileName    string
 	ID          string
-	MaxUploadMB int
-	MaxPDFMB    int
 	Wide        bool
+}
+
+type zipReader interface {
+	io.Reader
+	io.ReaderAt
+	io.Seeker
 }
 
 type uploadLink struct {
@@ -148,10 +153,10 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 		{{else if .ID}}
 			<section class="public-pdf">
 				<div class="public-pdf-actions">
-					<a class="btn btn-primary" href="/p/{{.ID}}/download">Скачать PDF</a>
+					<a class="btn btn-primary" href="/{{.ID}}/download">Скачать PDF</a>
 				</div>
 				<div class="pdf-viewer">
-					<iframe title="{{.FileName}}" src="/p/{{.ID}}/inline#toolbar=0&navpanes=0&scrollbar=0&view=FitH"></iframe>
+					<iframe title="{{.FileName}}" src="/{{.ID}}/inline#toolbar=0&navpanes=0&scrollbar=0&view=FitH"></iframe>
 				</div>
 			</section>
 		{{else}}
@@ -163,11 +168,17 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 					<nav class="sidebar-nav">
 						<a class="{{if eq .Active "upload"}}active{{end}}" href="/">Загрузить</a>
 						<a class="{{if eq .Active "uploaded"}}active{{end}}" href="/uploads">Загруженные</a>
-						<a href="/logout">Выйти</a>
+						<a class="{{if eq .Active "delete"}}active{{end}}" href="/delete">Удалить</a>
 					</nav>
 				</aside>
 
-				<section class="workspace">
+				<div class="app-main">
+					<header class="topbar">
+						<div></div>
+						<a class="btn btn-secondary" href="/logout">Выйти</a>
+					</header>
+
+					<section class="workspace">
 					{{if .Uploads}}
 						<header class="page-header">
 							<h1>Готово</h1>
@@ -201,12 +212,11 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 						{{if .Error}}<div class="alert alert-error" role="alert">{{.Error}}</div>{{end}}
 
 						<div class="card">
-							<form action="/upload" method="post" enctype="multipart/form-data" class="form">
+							<form action="/upload" method="post" enctype="multipart/form-data" class="form" data-upload-form>
 								<div class="field">
 									<label for="documents">Файлы</label>
 									<input id="documents" name="documents" type="file" accept="application/pdf,.pdf,application/zip,.zip" multiple required>
 									<p class="help">Можно выбрать несколько PDF или один ZIP-архив с PDF внутри. На каждый PDF будет создан отдельный URL.</p>
-									<p class="limits">PDF до {{.MaxPDFMB}} МБ, вся загрузка до {{.MaxUploadMB}} МБ.</p>
 								</div>
 
 								<div class="form-actions">
@@ -214,11 +224,39 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 								</div>
 							</form>
 						</div>
+
+						<div class="progress-panel" data-progress hidden>
+							<div class="progress-top">
+								<strong data-progress-title>Обработка</strong>
+								<span data-progress-percent>0%</span>
+							</div>
+							<div class="progress-track">
+								<div class="progress-bar" data-progress-bar></div>
+							</div>
+							<p data-progress-message></p>
+						</div>
 					{{else if eq .Active "uploaded"}}
 						<header class="page-header">
 							<h1>Загруженные</h1>
 							<button class="btn btn-primary" type="button" data-export-xlsx>Выгрузить XLSX</button>
 						</header>
+
+						<form action="/uploads" method="get" class="search-form">
+							<input name="q" type="text" value="{{.Query}}" placeholder="Поиск по названию или коду ссылки">
+							<button class="btn btn-secondary" type="submit">Найти</button>
+							{{if .Query}}<a class="btn btn-secondary" href="/uploads">Сбросить</a>{{end}}
+						</form>
+
+						<div class="progress-panel" data-progress hidden>
+							<div class="progress-top">
+								<strong data-progress-title>Обработка</strong>
+								<span data-progress-percent>0%</span>
+							</div>
+							<div class="progress-track">
+								<div class="progress-bar" data-progress-bar></div>
+							</div>
+							<p data-progress-message></p>
+						</div>
 
 						{{if .Files}}
 							<div class="table-list">
@@ -242,6 +280,34 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 						{{else}}
 							<div class="empty-state">Пока нет загруженных PDF.</div>
 						{{end}}
+					{{else if eq .Active "delete"}}
+						<header class="page-header">
+							<h1>Удалить</h1>
+						</header>
+
+						<div class="card tools-card">
+							<form class="form" data-delete-form>
+								<div class="field">
+									<label for="delete-xlsx">XLSX с названиями файлов</label>
+									<input id="delete-xlsx" name="delete-xlsx" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+									<p class="help">В первой колонке должны быть названия файлов без расширения или с .pdf.</p>
+								</div>
+								<div class="form-actions">
+									<button class="btn btn-primary" type="submit">Удалить найденные</button>
+								</div>
+							</form>
+						</div>
+
+						<div class="progress-panel" data-progress hidden>
+							<div class="progress-top">
+								<strong data-progress-title>Обработка</strong>
+								<span data-progress-percent>0%</span>
+							</div>
+							<div class="progress-track">
+								<div class="progress-bar" data-progress-bar></div>
+							</div>
+							<p data-progress-message></p>
+						</div>
 					{{else}}
 						<header class="page-header">
 							<h1>{{.Title}}</h1>
@@ -249,7 +315,8 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 						{{if .Error}}<div class="alert alert-error" role="alert">{{.Error}}</div>{{end}}
 						<a class="btn btn-primary" href="/">Загрузить PDF</a>
 					{{end}}
-				</section>
+					</section>
+				</div>
 			</div>
 		{{end}}
 	</main>
@@ -265,6 +332,8 @@ func main() {
 	must(err)
 	defer db.Close()
 	authDB = db
+	must(migrateLegacyMeta(db))
+	must(normalizeStoredLinkPaths(db))
 
 	if len(os.Args) > 1 {
 		runCommand(db, os.Args[1:])
@@ -303,17 +372,27 @@ func route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		renderUploaded(w, r)
+	case isReadMethod(r.Method) && r.URL.Path == "/delete":
+		if !requireAuth(w, r) {
+			return
+		}
+		renderDelete(w)
 	case isReadMethod(r.Method) && r.URL.Path == "/ws/uploads.xlsx":
 		if !requireAuth(w, r) {
 			return
 		}
 		exportUploadsXLSX(w, r)
+	case isReadMethod(r.Method) && r.URL.Path == "/ws/delete.xlsx":
+		if !requireAuth(w, r) {
+			return
+		}
+		deleteUploadsXLSX(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/upload":
 		if !requireAuth(w, r) {
 			return
 		}
 		upload(w, r)
-	case isReadMethod(r.Method) && strings.HasPrefix(r.URL.Path, "/p/"):
+	case isReadMethod(r.Method) && isPDFPath(r.URL.Path):
 		handlePDF(w, r)
 	default:
 		notFound(w)
@@ -377,9 +456,8 @@ func logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func upload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes+1024)
-	if err := r.ParseMultipartForm(maxRequestBytes); err != nil {
-		renderUpload(w, "Загрузка должна быть до 100 МБ.")
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		renderUpload(w, "Не удалось прочитать загрузку.")
 		return
 	}
 
@@ -404,11 +482,6 @@ func upload(w http.ResponseWriter, r *http.Request) {
 		var metas []fileMeta
 		switch ext {
 		case ".pdf":
-			if header.Size > maxPDFBytes {
-				file.Close()
-				renderUpload(w, "Каждый PDF должен быть до 25 МБ.")
-				return
-			}
 			meta, err := savePDF(name, file)
 			if err == nil {
 				metas = append(metas, meta)
@@ -444,32 +517,24 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func saveZipPDFs(file io.Reader) ([]fileMeta, error) {
-	data, err := io.ReadAll(io.LimitReader(file, maxRequestBytes+1))
+func saveZipPDFs(file zipReader) ([]fileMeta, error) {
+	size, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > maxRequestBytes {
-		return nil, fmt.Errorf("request too large")
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
 	}
 
-	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	reader, err := zip.NewReader(file, size)
 	if err != nil {
 		return nil, fmt.Errorf("bad zip")
 	}
 
 	var metas []fileMeta
-	var totalUncompressed uint64
 	for _, zipped := range reader.File {
 		if zipped.FileInfo().IsDir() || !strings.EqualFold(filepath.Ext(zipped.Name), ".pdf") {
 			continue
-		}
-		if zipped.UncompressedSize64 > maxPDFBytes {
-			return nil, fmt.Errorf("pdf too large")
-		}
-		totalUncompressed += zipped.UncompressedSize64
-		if totalUncompressed > maxRequestBytes {
-			return nil, fmt.Errorf("request too large")
 		}
 
 		rc, err := zipped.Open()
@@ -492,9 +557,8 @@ func saveZipPDFs(file io.Reader) ([]fileMeta, error) {
 
 func savePDF(name string, src io.Reader) (fileMeta, error) {
 	var meta fileMeta
-	limited := &io.LimitedReader{R: src, N: maxPDFBytes + 1}
 	signature := make([]byte, 4)
-	n, err := io.ReadFull(limited, signature)
+	n, err := io.ReadFull(src, signature)
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return meta, err
 	}
@@ -510,33 +574,34 @@ func savePDF(name string, src io.Reader) (fileMeta, error) {
 		return meta, err
 	}
 
-	targetName := id
+	targetName := filepath.Join(id, name)
 	targetPath := filepath.Join(filesDir, targetName)
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o775); err != nil {
+		return meta, err
+	}
 	out, err := os.Create(targetPath)
 	if err != nil {
 		return meta, err
 	}
 	defer out.Close()
 
-	written, err := io.Copy(out, io.MultiReader(bytes.NewReader(signature[:n]), limited))
+	written, err := io.Copy(out, io.MultiReader(bytes.NewReader(signature[:n]), src))
 	if err != nil {
 		_ = os.Remove(targetPath)
 		return meta, err
-	}
-	if written > maxPDFBytes {
-		_ = os.Remove(targetPath)
-		return meta, fmt.Errorf("pdf too large")
 	}
 
 	meta = fileMeta{
 		ID:           id,
 		File:         targetName,
 		OriginalName: name,
+		LinkPath:     "/" + id,
 		Size:         written,
 		CreatedAt:    time.Now().UTC(),
 	}
 	if err := saveMeta(meta); err != nil {
 		_ = os.Remove(targetPath)
+		_ = os.Remove(filepath.Dir(targetPath))
 		return meta, err
 	}
 	return meta, nil
@@ -548,14 +613,10 @@ func uploadErrorMessage(name string, err error) string {
 		return "Можно загружать только PDF-файлы или ZIP-архивы."
 	case "not pdf":
 		return "Файл " + name + " не похож на настоящий PDF."
-	case "pdf too large":
-		return "Каждый PDF должен быть до 25 МБ."
 	case "bad zip":
 		return "Не удалось прочитать ZIP-архив."
 	case "empty zip":
 		return "В ZIP-архиве не найдено PDF-файлов."
-	case "request too large":
-		return "Загрузка должна быть до 100 МБ."
 	default:
 		return "Не удалось обработать файл " + name + "."
 	}
@@ -563,12 +624,26 @@ func uploadErrorMessage(name string, err error) string {
 
 func handlePDF(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) < 2 || len(parts) > 3 || parts[0] != "p" || parts[1] == "" {
+	if len(parts) < 1 || len(parts) > 3 || parts[0] == "" {
 		notFound(w)
 		return
 	}
 
-	id, err := url.PathUnescape(parts[1])
+	if parts[0] == "p" {
+		if len(parts) < 2 || parts[1] == "" {
+			notFound(w)
+			return
+		}
+		redirectLegacyPDFPath(w, r, parts)
+		return
+	}
+
+	if len(parts) > 2 {
+		notFound(w)
+		return
+	}
+
+	id, err := url.PathUnescape(parts[0])
 	if err != nil || !validPublicID(id) {
 		notFound(w)
 		return
@@ -580,7 +655,7 @@ func handlePDF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(parts) == 2 {
+	if len(parts) == 1 {
 		render(w, pageData{
 			Title:    meta.OriginalName,
 			FileName: meta.OriginalName,
@@ -590,16 +665,61 @@ func handlePDF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if parts[2] != "inline" && parts[2] != "download" {
+	if parts[1] != "inline" && parts[1] != "download" {
 		notFound(w)
 		return
 	}
 
-	servePDF(w, r, meta, parts[2] == "download")
+	servePDF(w, r, meta, parts[1] == "download")
+}
+
+func isPDFPath(path string) bool {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		return false
+	}
+	if parts[0] == "p" {
+		return len(parts) == 2 || len(parts) == 3
+	}
+	if isReservedPath(parts[0]) {
+		return false
+	}
+	return len(parts) == 1 || len(parts) == 2
+}
+
+func isReservedPath(first string) bool {
+	switch first {
+	case "assets", "delete", "login", "logout", "upload", "uploads", "ws":
+		return true
+	default:
+		return false
+	}
+}
+
+func redirectLegacyPDFPath(w http.ResponseWriter, r *http.Request, parts []string) {
+	id, err := url.PathUnescape(parts[1])
+	if err != nil || !validPublicID(id) {
+		notFound(w)
+		return
+	}
+
+	target := "/" + url.PathEscape(id)
+	if len(parts) == 3 {
+		if parts[2] != "inline" && parts[2] != "download" {
+			notFound(w)
+			return
+		}
+		target += "/" + parts[2]
+	}
+	http.Redirect(w, r, target, http.StatusMovedPermanently)
 }
 
 func servePDF(w http.ResponseWriter, r *http.Request, meta fileMeta, download bool) {
-	path := filepath.Join(filesDir, filepath.Base(meta.File))
+	path, err := storedFilePath(meta.File)
+	if err != nil {
+		notFound(w)
+		return
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		notFound(w)
@@ -619,11 +739,9 @@ func servePDF(w http.ResponseWriter, r *http.Request, meta fileMeta, download bo
 
 func renderUpload(w http.ResponseWriter, msg string) {
 	render(w, pageData{
-		Title:       "Загрузка PDF",
-		Active:      "upload",
-		Error:       msg,
-		MaxUploadMB: maxRequestBytes >> 20,
-		MaxPDFMB:    maxPDFBytes >> 20,
+		Title:  "Загрузка PDF",
+		Active: "upload",
+		Error:  msg,
 	})
 }
 
@@ -635,13 +753,30 @@ func renderLogin(w http.ResponseWriter, msg string) {
 	})
 }
 
-func renderUploaded(w http.ResponseWriter, r *http.Request) {
-	metas, err := loadAllMeta()
-	if err != nil {
-		http.Error(w, "cannot load files", http.StatusInternalServerError)
-		return
-	}
+func renderDelete(w http.ResponseWriter) {
+	render(w, pageData{
+		Title:  "Удалить",
+		Active: "delete",
+	})
+}
 
+func renderUploaded(w http.ResponseWriter, r *http.Request) {
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	var metas []fileMeta
+	var err error
+	if query != "" {
+		metas, err = searchMeta(query)
+		if err != nil {
+			http.Error(w, "cannot search files", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		metas, err = loadAllMeta()
+		if err != nil {
+			http.Error(w, "cannot load files", http.StatusInternalServerError)
+			return
+		}
+	}
 	files := make([]uploadedFile, 0, len(metas))
 	for _, meta := range metas {
 		url := publicURL(r, meta)
@@ -657,6 +792,7 @@ func renderUploaded(w http.ResponseWriter, r *http.Request) {
 	render(w, pageData{
 		Title:  "Загруженные",
 		Active: "uploaded",
+		Query:  query,
 		Files:  files,
 	})
 }
@@ -668,23 +804,86 @@ func exportUploadsXLSX(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.close()
 
+	_ = conn.writeProgress("export", 5, "Загружаем список файлов...")
 	metas, err := loadAllMeta()
 	if err != nil {
 		_ = conn.writeClose("cannot load files")
 		return
 	}
+	_ = conn.writeProgress("export", 35, "Сортируем данные...")
 	sort.Slice(metas, func(i, j int) bool {
 		return nameWithoutPDF(metas[i].OriginalName) < nameWithoutPDF(metas[j].OriginalName)
 	})
 
+	_ = conn.writeProgress("export", 65, "Формируем XLSX...")
 	xlsx, err := buildUploadsXLSX(metas)
 	if err != nil {
 		_ = conn.writeClose("cannot build xlsx")
 		return
 	}
+	_ = conn.writeProgress("export", 90, "Отправляем файл...")
 	if err := conn.writeBinary(xlsx); err != nil {
 		return
 	}
+	_ = conn.writeProgress("export", 100, "Готово.")
+	_ = conn.writeClose("")
+}
+
+func deleteUploadsXLSX(w http.ResponseWriter, r *http.Request) {
+	conn, err := acceptWebSocket(w, r)
+	if err != nil {
+		return
+	}
+	defer conn.close()
+
+	_ = conn.writeProgress("delete", 5, "Ждем XLSX-файл...")
+	data, err := conn.readBinary(maxWebSocketBytes)
+	if err != nil {
+		_ = conn.writeClose("cannot read xlsx")
+		return
+	}
+
+	_ = conn.writeProgress("delete", 20, "Читаем названия из первой колонки...")
+	names, err := readXLSXFirstColumn(data)
+	if err != nil {
+		_ = conn.writeClose("cannot parse xlsx")
+		return
+	}
+	if len(names) == 0 {
+		_ = conn.writeClose("xlsx has no names")
+		return
+	}
+
+	_ = conn.writeProgress("delete", 40, "Ищем совпадения...")
+	metas, err := loadAllMeta()
+	if err != nil {
+		_ = conn.writeClose("cannot load files")
+		return
+	}
+
+	wanted := map[string]bool{}
+	for _, name := range names {
+		wanted[normalizeFileTitle(name)] = true
+	}
+
+	deleted := 0
+	total := len(metas)
+	for i, meta := range metas {
+		if wanted[normalizeFileTitle(meta.OriginalName)] || wanted[normalizeFileTitle(nameWithoutPDF(meta.OriginalName))] {
+			if err := deleteMeta(meta); err != nil {
+				_ = conn.writeClose("cannot delete files")
+				return
+			}
+			deleted++
+		}
+		progress := 40
+		if total > 0 {
+			progress = 40 + int(float64(i+1)/float64(total)*55)
+		}
+		_ = conn.writeProgress("delete", progress, fmt.Sprintf("Удалено: %d", deleted))
+	}
+
+	_ = conn.writeProgress("delete", 100, fmt.Sprintf("Готово. Удалено файлов: %d", deleted))
 	_ = conn.writeClose("")
 }
 
@@ -701,11 +900,27 @@ func notFound(w http.ResponseWriter) {
 }
 
 func saveMeta(meta fileMeta) error {
-	data, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return err
+	if authDB == nil {
+		return fmt.Errorf("database is not ready")
 	}
-	return os.WriteFile(filepath.Join(metaDir, meta.ID+".json"), data, 0o664)
+	meta.LinkPath = normalizeLinkPath(meta.ID, meta.LinkPath)
+	_, err := authDB.Exec(
+		`INSERT INTO pdf_files (id, file_path, original_name, link_path, size, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (id) DO UPDATE SET
+			file_path = EXCLUDED.file_path,
+			original_name = EXCLUDED.original_name,
+			link_path = EXCLUDED.link_path,
+			size = EXCLUDED.size,
+			created_at = EXCLUDED.created_at`,
+		meta.ID,
+		meta.File,
+		meta.OriginalName,
+		meta.LinkPath,
+		meta.Size,
+		meta.CreatedAt,
+	)
+	return err
 }
 
 func loadMeta(id string) (fileMeta, error) {
@@ -714,36 +929,85 @@ func loadMeta(id string) (fileMeta, error) {
 	}
 
 	var meta fileMeta
-	data, err := os.ReadFile(filepath.Join(metaDir, id+".json"))
-	if err != nil {
-		return meta, err
-	}
-	return meta, json.Unmarshal(data, &meta)
+	err := authDB.QueryRow(
+		`SELECT id, file_path, original_name, link_path, size, created_at FROM pdf_files WHERE id = $1`,
+		id,
+	).Scan(&meta.ID, &meta.File, &meta.OriginalName, &meta.LinkPath, &meta.Size, &meta.CreatedAt)
+	return meta, err
 }
 
 func loadAllMeta() ([]fileMeta, error) {
-	entries, err := os.ReadDir(metaDir)
+	rows, err := authDB.Query(
+		`SELECT id, file_path, original_name, link_path, size, created_at
+		 FROM pdf_files
+		 ORDER BY created_at DESC`,
+	)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
-	metas := make([]fileMeta, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
-			continue
-		}
-		id := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
-		meta, err := loadMeta(id)
-		if err != nil {
-			continue
+	var metas []fileMeta
+	for rows.Next() {
+		var meta fileMeta
+		if err := rows.Scan(&meta.ID, &meta.File, &meta.OriginalName, &meta.LinkPath, &meta.Size, &meta.CreatedAt); err != nil {
+			return nil, err
 		}
 		metas = append(metas, meta)
 	}
+	return metas, rows.Err()
+}
 
-	sort.Slice(metas, func(i, j int) bool {
-		return metas[i].CreatedAt.After(metas[j].CreatedAt)
-	})
-	return metas, nil
+func searchMeta(query string) ([]fileMeta, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return loadAllMeta()
+	}
+	like := "%" + strings.ToLower(query) + "%"
+	rows, err := authDB.Query(
+		`SELECT id, file_path, original_name, link_path, size, created_at
+		 FROM pdf_files
+		 WHERE LOWER(original_name) LIKE $1
+		    OR LOWER(id) LIKE $1
+		    OR LOWER(link_path) LIKE $1
+		 ORDER BY created_at DESC`,
+		like,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metas []fileMeta
+	for rows.Next() {
+		var meta fileMeta
+		if err := rows.Scan(&meta.ID, &meta.File, &meta.OriginalName, &meta.LinkPath, &meta.Size, &meta.CreatedAt); err != nil {
+			return nil, err
+		}
+		metas = append(metas, meta)
+	}
+	return metas, rows.Err()
+}
+
+func deleteMeta(meta fileMeta) error {
+	filePath, err := storedFilePath(meta.File)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_ = os.Remove(filepath.Dir(filePath))
+	_, err = authDB.Exec(`DELETE FROM pdf_files WHERE id = $1`, meta.ID)
+	return err
+}
+
+func storedFilePath(name string) (string, error) {
+	clean := filepath.Clean(name)
+	if clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || clean == ".." {
+		return "", fmt.Errorf("invalid stored file path")
+	}
+	return filepath.Join(filesDir, clean), nil
 }
 
 func newPublicID() (string, error) {
@@ -752,10 +1016,12 @@ func newPublicID() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if _, err := os.Stat(filepath.Join(metaDir, id+".json")); errors.Is(err, os.ErrNotExist) {
-			return id, nil
-		} else if err != nil {
+		var exists bool
+		if err := authDB.QueryRow(`SELECT EXISTS (SELECT 1 FROM pdf_files WHERE id = $1)`, id).Scan(&exists); err != nil {
 			return "", err
+		}
+		if !exists {
+			return id, nil
 		}
 	}
 	return "", fmt.Errorf("cannot allocate public URL for file")
@@ -802,7 +1068,22 @@ func validPublicID(id string) bool {
 }
 
 func publicURL(r *http.Request, meta fileMeta) string {
-	return baseURL(r) + "/p/" + url.PathEscape(meta.ID)
+	return baseURL(r) + normalizeLinkPath(meta.ID, meta.LinkPath)
+}
+
+func normalizeLinkPath(id, linkPath string) string {
+	id = url.PathEscape(id)
+	linkPath = strings.TrimSpace(linkPath)
+	if linkPath == "" {
+		return "/" + id
+	}
+	if strings.HasPrefix(linkPath, "/p/") {
+		return "/" + strings.TrimPrefix(linkPath, "/p/")
+	}
+	if !strings.HasPrefix(linkPath, "/") {
+		return "/" + linkPath
+	}
+	return linkPath
 }
 
 func baseURL(r *http.Request) string {
@@ -930,6 +1211,117 @@ func runMigrations(db *sql.DB) error {
 	}
 
 	return nil
+}
+
+func migrateLegacyMeta(db *sql.DB) error {
+	entries, err := os.ReadDir(metaDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(metaDir, entry.Name()))
+		if err != nil {
+			return err
+		}
+		var meta fileMeta
+		if err := json.Unmarshal(data, &meta); err != nil {
+			return err
+		}
+		if meta.ID == "" || meta.OriginalName == "" {
+			continue
+		}
+		meta.LinkPath = normalizeLinkPath(meta.ID, meta.LinkPath)
+		if meta.File == "" {
+			meta.File = meta.ID
+		}
+		meta.File = migrateLegacyPDFPath(meta)
+
+		_, err = db.Exec(
+			`INSERT INTO pdf_files (id, file_path, original_name, link_path, size, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6)
+			 ON CONFLICT (id) DO NOTHING`,
+			meta.ID,
+			meta.File,
+			meta.OriginalName,
+			meta.LinkPath,
+			meta.Size,
+			meta.CreatedAt,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizeStoredLinkPaths(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id, link_path FROM pdf_files`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type update struct {
+		id   string
+		link string
+	}
+	var updates []update
+	for rows.Next() {
+		var id, linkPath string
+		if err := rows.Scan(&id, &linkPath); err != nil {
+			return err
+		}
+		normalized := normalizeLinkPath(id, linkPath)
+		if normalized != linkPath {
+			updates = append(updates, update{id: id, link: normalized})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, item := range updates {
+		if _, err := db.Exec(`UPDATE pdf_files SET link_path = $1 WHERE id = $2`, item.link, item.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func migrateLegacyPDFPath(meta fileMeta) string {
+	oldPath := filepath.Join(filesDir, filepath.Base(meta.File))
+	targetName := filepath.Join(meta.ID, sanitizeFileName(meta.OriginalName))
+	targetPath := filepath.Join(filesDir, targetName)
+
+	if _, err := os.Stat(targetPath); err == nil {
+		return targetName
+	}
+	info, err := os.Stat(oldPath)
+	if err != nil || info.IsDir() {
+		return meta.File
+	}
+
+	tmpPath := oldPath + ".migrating"
+	if err := os.Rename(oldPath, tmpPath); err != nil {
+		return meta.File
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o775); err != nil {
+		_ = os.Rename(tmpPath, oldPath)
+		return meta.File
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		_ = os.Rename(tmpPath, oldPath)
+		return meta.File
+	}
+	return targetName
 }
 
 func migrationApplied(db *sql.DB, name string) (bool, error) {
@@ -1256,6 +1648,29 @@ func (c *webSocketConn) writeBinary(data []byte) error {
 	return c.writeFrame(0x2, data)
 }
 
+func (c *webSocketConn) writeText(text string) error {
+	return c.writeFrame(0x1, []byte(text))
+}
+
+func (c *webSocketConn) writeProgress(kind string, percent int, message string) error {
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	data, err := json.Marshal(map[string]any{
+		"type":    "progress",
+		"kind":    kind,
+		"percent": percent,
+		"message": message,
+	})
+	if err != nil {
+		return err
+	}
+	return c.writeText(string(data))
+}
+
 func (c *webSocketConn) writeClose(reason string) error {
 	payload := []byte{0x03, 0xe8}
 	if reason != "" {
@@ -1284,6 +1699,71 @@ func (c *webSocketConn) writeFrame(opcode byte, payload []byte) error {
 		return err
 	}
 	return c.rw.Flush()
+}
+
+func (c *webSocketConn) readBinary(maxBytes int64) ([]byte, error) {
+	for {
+		opcode, payload, err := c.readFrame(maxBytes)
+		if err != nil {
+			return nil, err
+		}
+		switch opcode {
+		case 0x2:
+			return payload, nil
+		case 0x8:
+			return nil, fmt.Errorf("websocket closed")
+		case 0x9:
+			if err := c.writeFrame(0xA, payload); err != nil {
+				return nil, err
+			}
+		}
+	}
+}
+
+func (c *webSocketConn) readFrame(maxBytes int64) (byte, []byte, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(c.rw, header); err != nil {
+		return 0, nil, err
+	}
+
+	opcode := header[0] & 0x0f
+	masked := header[1]&0x80 != 0
+	size := int64(header[1] & 0x7f)
+	switch size {
+	case 126:
+		var b [2]byte
+		if _, err := io.ReadFull(c.rw, b[:]); err != nil {
+			return 0, nil, err
+		}
+		size = int64(binary.BigEndian.Uint16(b[:]))
+	case 127:
+		var b [8]byte
+		if _, err := io.ReadFull(c.rw, b[:]); err != nil {
+			return 0, nil, err
+		}
+		size = int64(binary.BigEndian.Uint64(b[:]))
+	}
+	if size < 0 || size > maxBytes {
+		return 0, nil, fmt.Errorf("websocket payload too large")
+	}
+
+	var mask [4]byte
+	if masked {
+		if _, err := io.ReadFull(c.rw, mask[:]); err != nil {
+			return 0, nil, err
+		}
+	}
+
+	payload := make([]byte, int(size))
+	if _, err := io.ReadFull(c.rw, payload); err != nil {
+		return 0, nil, err
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= mask[i%4]
+		}
+	}
+	return opcode, payload, nil
 }
 
 func (c *webSocketConn) close() {
@@ -1363,6 +1843,209 @@ func nameWithoutPDF(name string) string {
 	return name
 }
 
+func normalizeFileTitle(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.TrimPrefix(name, "\ufeff")
+	name = nameWithoutPDF(name)
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func readXLSXFirstColumn(data []byte) ([]string, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, err
+	}
+
+	shared, err := readXLSXSharedStrings(zr)
+	if err != nil {
+		return nil, err
+	}
+
+	sheet, err := readXLSXPart(zr, "xl/worksheets/sheet1.xml")
+	if err != nil {
+		return nil, err
+	}
+
+	decoder := xml.NewDecoder(strings.NewReader(sheet))
+	var names []string
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok || start.Name.Local != "c" {
+			continue
+		}
+
+		ref := xmlAttr(start, "r")
+		if ref != "" && cellColumn(ref) != "A" {
+			if err := skipXMLCell(decoder); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		value, err := readXLSXCell(decoder, xmlAttr(start, "t"), shared)
+		if err != nil {
+			return nil, err
+		}
+		value = strings.TrimSpace(value)
+		if value != "" {
+			names = append(names, value)
+		}
+	}
+	return names, nil
+}
+
+func readXLSXSharedStrings(zr *zip.Reader) ([]string, error) {
+	data, err := readXLSXPart(zr, "xl/sharedStrings.xml")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	decoder := xml.NewDecoder(strings.NewReader(data))
+	var values []string
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok || start.Name.Local != "si" {
+			continue
+		}
+		value, err := readSharedString(decoder)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, nil
+}
+
+func readSharedString(decoder *xml.Decoder) (string, error) {
+	var b strings.Builder
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "t" {
+				var value string
+				if err := decoder.DecodeElement(&value, &t); err != nil {
+					return "", err
+				}
+				b.WriteString(value)
+			}
+		case xml.EndElement:
+			if t.Name.Local == "si" {
+				return b.String(), nil
+			}
+		}
+	}
+}
+
+func readXLSXCell(decoder *xml.Decoder, cellType string, shared []string) (string, error) {
+	var value string
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "t" || t.Name.Local == "v" {
+				var part string
+				if err := decoder.DecodeElement(&part, &t); err != nil {
+					return "", err
+				}
+				value += part
+			}
+		case xml.EndElement:
+			if t.Name.Local == "c" {
+				if cellType == "s" {
+					var idx int
+					if _, err := fmt.Sscanf(strings.TrimSpace(value), "%d", &idx); err == nil && idx >= 0 && idx < len(shared) {
+						return shared[idx], nil
+					}
+				}
+				return value, nil
+			}
+		}
+	}
+}
+
+func skipXMLCell(decoder *xml.Decoder) error {
+	depth := 1
+	for depth > 0 {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		switch token.(type) {
+		case xml.StartElement:
+			depth++
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return nil
+}
+
+func readXLSXPart(zr *zip.Reader, name string) (string, error) {
+	for _, file := range zr.File {
+		if file.Name != name {
+			continue
+		}
+		rc, err := file.Open()
+		if err != nil {
+			return "", err
+		}
+		defer rc.Close()
+		data, err := io.ReadAll(rc)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	}
+	return "", os.ErrNotExist
+}
+
+func xmlAttr(start xml.StartElement, name string) string {
+	for _, attr := range start.Attr {
+		if attr.Name.Local == name {
+			return attr.Value
+		}
+	}
+	return ""
+}
+
+func cellColumn(ref string) string {
+	var b strings.Builder
+	for _, r := range ref {
+		if r >= 'a' && r <= 'z' {
+			r -= 'a' - 'A'
+		}
+		if r < 'A' || r > 'Z' {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 func writeInlineCell(b *strings.Builder, col string, row int, value string) {
 	b.WriteString(fmt.Sprintf(`<c r="%s%d" t="inlineStr"><is><t>`, col, row))
 	_ = xml.EscapeText(b, []byte(value))
@@ -1370,45 +2053,178 @@ func writeInlineCell(b *strings.Builder, col string, row int, value string) {
 }
 
 const js = `(() => {
-    const button = document.querySelector("[data-export-xlsx]");
-    if (!button) {
-        return;
+    const progress = document.querySelector("[data-progress]");
+    const progressTitle = document.querySelector("[data-progress-title]");
+    const progressPercent = document.querySelector("[data-progress-percent]");
+    const progressBar = document.querySelector("[data-progress-bar]");
+    const progressMessage = document.querySelector("[data-progress-message]");
+
+    const showProgress = (title, percent, message) => {
+        if (!progress) {
+            return;
+        }
+        progress.hidden = false;
+        progressTitle.textContent = title;
+        progressPercent.textContent = percent + "%";
+        progressBar.style.width = percent + "%";
+        progressMessage.textContent = message || "";
+    };
+
+    const wsURL = (path) => {
+        const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+        return scheme + "//" + window.location.host + path;
+    };
+
+    const handleProgressMessage = (event, fallbackTitle) => {
+        if (typeof event.data !== "string") {
+            return false;
+        }
+        try {
+            const payload = JSON.parse(event.data);
+            if (payload.type === "progress") {
+                showProgress(fallbackTitle, payload.percent || 0, payload.message || "");
+                return true;
+            }
+        } catch (_) {
+        }
+        return false;
+    };
+
+    const uploadForm = document.querySelector("[data-upload-form]");
+    if (uploadForm) {
+        uploadForm.addEventListener("submit", (event) => {
+            event.preventDefault();
+
+            const button = uploadForm.querySelector("button[type=submit]");
+            const input = uploadForm.querySelector("input[type=file]");
+            const originalText = button.textContent;
+
+            if (!input || !input.files || input.files.length === 0) {
+                return;
+            }
+
+            button.disabled = true;
+            button.textContent = "Загрузка...";
+            showProgress("Загрузка файлов", 0, "Готовим отправку...");
+
+            const request = new XMLHttpRequest();
+            request.open("POST", uploadForm.action);
+
+            request.upload.onprogress = (event) => {
+                if (!event.lengthComputable) {
+                    showProgress("Загрузка файлов", 0, "Отправляем файлы...");
+                    return;
+                }
+                const percent = Math.min(99, Math.round((event.loaded / event.total) * 100));
+                showProgress("Загрузка файлов", percent, "Отправлено " + percent + "%");
+            };
+
+            request.onload = () => {
+                if (request.status >= 200 && request.status < 300) {
+                    showProgress("Загрузка файлов", 100, "Файлы отправлены. Открываем результат...");
+                    document.open();
+                    document.write(request.responseText);
+                    document.close();
+                    return;
+                }
+                button.disabled = false;
+                button.textContent = originalText;
+                showProgress("Загрузка файлов", 0, "Не удалось загрузить файлы.");
+            };
+
+            request.onerror = () => {
+                button.disabled = false;
+                button.textContent = originalText;
+                showProgress("Загрузка файлов", 0, "Соединение оборвалось во время загрузки.");
+            };
+
+            request.send(new FormData(uploadForm));
+        });
     }
 
-    button.addEventListener("click", () => {
-        const originalText = button.textContent;
-        button.disabled = true;
-        button.textContent = "Выгрузка...";
+    const exportButton = document.querySelector("[data-export-xlsx]");
+    if (exportButton) {
+        exportButton.addEventListener("click", () => {
+            const originalText = exportButton.textContent;
+            exportButton.disabled = true;
+            exportButton.textContent = "Выгрузка...";
+            showProgress("Выгрузка XLSX", 0, "Начинаем...");
 
-        const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const socket = new WebSocket(scheme + "//" + window.location.host + "/ws/uploads.xlsx");
-        socket.binaryType = "arraybuffer";
+            const socket = new WebSocket(wsURL("/ws/uploads.xlsx"));
+            socket.binaryType = "arraybuffer";
 
-        socket.onmessage = (event) => {
-            const blob = new Blob([event.data], {
-                type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            });
-            const link = document.createElement("a");
-            link.href = URL.createObjectURL(blob);
-            link.download = "uploads.xlsx";
-            document.body.appendChild(link);
-            link.click();
-            URL.revokeObjectURL(link.href);
-            link.remove();
-            socket.close();
-        };
+            socket.onmessage = (event) => {
+                if (handleProgressMessage(event, "Выгрузка XLSX")) {
+                    return;
+                }
+                const blob = new Blob([event.data], {
+                    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                });
+                const link = document.createElement("a");
+                link.href = URL.createObjectURL(blob);
+                link.download = "uploads.xlsx";
+                document.body.appendChild(link);
+                link.click();
+                URL.revokeObjectURL(link.href);
+                link.remove();
+            };
 
-        socket.onclose = () => {
-            button.disabled = false;
-            button.textContent = originalText;
-        };
+            socket.onclose = () => {
+                exportButton.disabled = false;
+                exportButton.textContent = originalText;
+            };
 
-        socket.onerror = () => {
-            button.disabled = false;
-            button.textContent = originalText;
-            alert("Не удалось выгрузить XLSX.");
-        };
-    });
+            socket.onerror = () => {
+                exportButton.disabled = false;
+                exportButton.textContent = originalText;
+                alert("Не удалось выгрузить XLSX.");
+            };
+        });
+    }
+
+    const deleteForm = document.querySelector("[data-delete-form]");
+    if (deleteForm) {
+        deleteForm.addEventListener("submit", (event) => {
+            event.preventDefault();
+            const input = deleteForm.querySelector("input[type=file]");
+            const file = input && input.files && input.files[0];
+            if (!file) {
+                return;
+            }
+
+            const button = deleteForm.querySelector("button[type=submit]");
+            const originalText = button.textContent;
+            button.disabled = true;
+            button.textContent = "Удаление...";
+            showProgress("Удаление по XLSX", 0, "Подключаемся...");
+
+            const socket = new WebSocket(wsURL("/ws/delete.xlsx"));
+            socket.binaryType = "arraybuffer";
+
+            socket.onopen = () => {
+                showProgress("Удаление по XLSX", 5, "Отправляем XLSX...");
+                socket.send(file);
+            };
+
+            socket.onmessage = (event) => {
+                handleProgressMessage(event, "Удаление по XLSX");
+            };
+
+            socket.onclose = () => {
+                button.disabled = false;
+                button.textContent = originalText;
+                if (progressBar && progressBar.style.width === "100%") {
+                    window.setTimeout(() => window.location.reload(), 700);
+                }
+            };
+
+            socket.onerror = () => {
+                button.disabled = false;
+                button.textContent = originalText;
+                alert("Не удалось удалить файлы по XLSX.");
+            };
+        });
+    }
 })();`
 
 const css = `:root {
@@ -1462,6 +2278,7 @@ a {
 .app-layout {
     display: grid;
     grid-template-columns: 240px minmax(0, 1fr);
+    min-width: 900px;
     min-height: 100vh;
 }
 
@@ -1505,6 +2322,24 @@ a {
 .sidebar-nav a.active {
     background: #e8f0fe;
     color: var(--primary);
+}
+
+.app-main {
+    min-width: 0;
+}
+
+.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 64px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    padding: 12px 28px;
+}
+
+.topbar .btn {
+    width: auto;
 }
 
 .workspace {
@@ -1610,6 +2445,14 @@ input[type="file"] {
 input:focus {
     border-color: var(--primary);
     outline: 3px solid rgba(29, 78, 216, 0.14);
+}
+
+.search-form {
+    max-width: 920px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 10px;
+    margin-bottom: 14px;
 }
 
 .help,
@@ -1724,6 +2567,51 @@ input:focus {
     gap: 10px;
 }
 
+.tools-card {
+    margin-bottom: 14px;
+}
+
+.progress-panel {
+    max-width: 920px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    padding: 14px;
+    margin-bottom: 14px;
+}
+
+.progress-top {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    color: #111827;
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+.progress-track {
+    height: 10px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--secondary);
+    margin-top: 10px;
+}
+
+.progress-bar {
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--primary);
+    transition: width 160ms ease;
+}
+
+.progress-panel p {
+    margin: 10px 0 0;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.45;
+}
+
 .file-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
@@ -1802,82 +2690,4 @@ input:focus {
     min-height: 620px;
     border: 0;
     background: var(--surface);
-}
-
-@media (max-width: 760px) {
-    .app-layout {
-        grid-template-columns: 1fr;
-    }
-
-    .sidebar {
-        border-right: 0;
-        border-bottom: 1px solid var(--border);
-        padding: 14px;
-    }
-
-    .brand {
-        padding: 0 4px 12px;
-        margin-bottom: 10px;
-    }
-
-    .sidebar-nav {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
-    .sidebar-nav a {
-        justify-content: center;
-        min-height: 38px;
-        padding: 8px;
-        text-align: center;
-    }
-
-    .workspace {
-        padding: 18px;
-    }
-
-    .page-header {
-        margin-bottom: 14px;
-    }
-
-    .page-header h1 {
-        font-size: 22px;
-    }
-
-    .card,
-    .login-panel {
-        padding: 18px;
-    }
-
-    .file-row {
-        grid-template-columns: 1fr;
-        align-items: stretch;
-    }
-
-    .file-actions,
-    .actions,
-    .form-actions {
-        flex-direction: column;
-        align-items: stretch;
-    }
-
-    .btn {
-        width: 100%;
-    }
-
-    .public-pdf {
-        padding: 8px;
-    }
-
-    .public-pdf-actions {
-        margin-bottom: 8px;
-    }
-
-    .pdf-viewer {
-        border-radius: 6px;
-    }
-
-    .pdf-viewer iframe {
-        height: calc(100vh - 64px);
-        min-height: 520px;
-    }
 }`
