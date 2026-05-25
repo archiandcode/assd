@@ -39,11 +39,11 @@ import (
 var migrationFiles embed.FS
 
 const (
-	defaultAddr     = ":8010"
-	defaultDBURL    = "host=/tmp/url-generator-postgres port=5432 user=url_generator password=url_generator_password dbname=url_generator sslmode=disable"
-	sessionCookie   = "url_generator_session"
-	passwordIters   = 210000
-	publicIDLength  = 5
+	defaultAddr       = ":8010"
+	defaultDBURL      = "host=/tmp/url-generator-postgres port=5432 user=url_generator password=url_generator_password dbname=url_generator sslmode=disable"
+	sessionCookie     = "url_generator_session"
+	passwordIters     = 210000
+	publicIDLength    = 5
 	maxWebSocketBytes = 100 << 20
 )
 
@@ -54,6 +54,7 @@ var (
 	authDB   *sql.DB
 	logins   = newLoginLimiter(5, 10*time.Minute)
 	idMu     sync.Mutex
+	csrfKey  = mustRandomKey()
 )
 
 type fileMeta struct {
@@ -66,16 +67,17 @@ type fileMeta struct {
 }
 
 type pageData struct {
-	Title       string
-	Active      string
-	Error       string
-	Query       string
-	Login       bool
-	Uploads     []uploadLink
-	Files       []uploadedFile
-	FileName    string
-	ID          string
-	Wide        bool
+	Title     string
+	Active    string
+	Error     string
+	Query     string
+	Login     bool
+	Uploads   []uploadLink
+	Files     []uploadedFile
+	FileName  string
+	ID        string
+	Wide      bool
+	CSRFToken string
 }
 
 type zipReader interface {
@@ -121,6 +123,7 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>{{.Title}}</title>
+	{{if .CSRFToken}}<meta name="csrf-token" content="{{.CSRFToken}}">{{end}}
 	<link rel="stylesheet" href="/assets/styles.css">
 </head>
 <body>
@@ -212,7 +215,7 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 						{{if .Error}}<div class="alert alert-error" role="alert">{{.Error}}</div>{{end}}
 
 						<div class="card">
-							<form action="/upload" method="post" enctype="multipart/form-data" class="form" data-upload-form>
+							<form action="/upload?csrf_token={{.CSRFToken}}" method="post" enctype="multipart/form-data" class="form" data-upload-form>
 								<div class="field">
 									<label for="documents">Файлы</label>
 									<input id="documents" name="documents" type="file" accept="application/pdf,.pdf,application/zip,.zip" multiple required>
@@ -347,7 +350,13 @@ func main() {
 
 	addr := listenAddr()
 	log.Printf("listening on http://localhost%s", addr)
-	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           securityHeaders(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	log.Fatal(server.ListenAndServe())
 }
 
 func route(w http.ResponseWriter, r *http.Request) {
@@ -366,7 +375,7 @@ func route(w http.ResponseWriter, r *http.Request) {
 		if !requireAuth(w, r) {
 			return
 		}
-		renderUpload(w, "")
+		renderUpload(w, r, "")
 	case isReadMethod(r.Method) && r.URL.Path == "/uploads":
 		if !requireAuth(w, r) {
 			return
@@ -376,9 +385,12 @@ func route(w http.ResponseWriter, r *http.Request) {
 		if !requireAuth(w, r) {
 			return
 		}
-		renderDelete(w)
+		renderDelete(w, r)
 	case isReadMethod(r.Method) && r.URL.Path == "/ws/uploads.xlsx":
 		if !requireAuth(w, r) {
+			return
+		}
+		if !requireCSRF(w, r) {
 			return
 		}
 		exportUploadsXLSX(w, r)
@@ -386,9 +398,15 @@ func route(w http.ResponseWriter, r *http.Request) {
 		if !requireAuth(w, r) {
 			return
 		}
+		if !requireCSRF(w, r) {
+			return
+		}
 		deleteUploadsXLSX(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/upload":
 		if !requireAuth(w, r) {
+			return
+		}
+		if !requireCSRF(w, r) {
 			return
 		}
 		upload(w, r)
@@ -457,14 +475,14 @@ func logout(w http.ResponseWriter, r *http.Request) {
 
 func upload(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		renderUpload(w, "Не удалось прочитать загрузку.")
+		renderUpload(w, r, "Не удалось прочитать загрузку.")
 		return
 	}
 
 	headers := r.MultipartForm.File["documents"]
 	headers = append(headers, r.MultipartForm.File["pdf"]...)
 	if len(headers) == 0 {
-		renderUpload(w, "Выберите PDF-файлы или ZIP-архив.")
+		renderUpload(w, r, "Выберите PDF-файлы или ZIP-архив.")
 		return
 	}
 
@@ -494,7 +512,7 @@ func upload(w http.ResponseWriter, r *http.Request) {
 		file.Close()
 
 		if err != nil {
-			renderUpload(w, uploadErrorMessage(name, err))
+			renderUpload(w, r, uploadErrorMessage(name, err))
 			return
 		}
 		for _, meta := range metas {
@@ -507,13 +525,14 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(uploads) == 0 {
-		renderUpload(w, "В загрузке не найдено PDF-файлов.")
+		renderUpload(w, r, "В загрузке не найдено PDF-файлов.")
 		return
 	}
 	render(w, pageData{
-		Title:   "Готово",
-		Active:  "upload",
-		Uploads: uploads,
+		Title:     "Готово",
+		Active:    "upload",
+		Uploads:   uploads,
+		CSRFToken: csrfToken(r),
 	})
 }
 
@@ -532,11 +551,7 @@ func saveZipPDFs(file zipReader) ([]fileMeta, error) {
 	}
 
 	var metas []fileMeta
-	for _, zipped := range reader.File {
-		if zipped.FileInfo().IsDir() || !strings.EqualFold(filepath.Ext(zipped.Name), ".pdf") {
-			continue
-		}
-
+	for _, zipped := range zipPDFEntries(reader.File) {
 		rc, err := zipped.Open()
 		if err != nil {
 			return nil, err
@@ -553,6 +568,17 @@ func saveZipPDFs(file zipReader) ([]fileMeta, error) {
 		return nil, fmt.Errorf("empty zip")
 	}
 	return metas, nil
+}
+
+func zipPDFEntries(files []*zip.File) []*zip.File {
+	pdfs := make([]*zip.File, 0, len(files))
+	for _, file := range files {
+		if file.FileInfo().IsDir() || !strings.EqualFold(filepath.Ext(file.Name), ".pdf") {
+			continue
+		}
+		pdfs = append(pdfs, file)
+	}
+	return pdfs
 }
 
 func savePDF(name string, src io.Reader) (fileMeta, error) {
@@ -737,11 +763,12 @@ func servePDF(w http.ResponseWriter, r *http.Request, meta fileMeta, download bo
 	http.ServeContent(w, r, meta.OriginalName, meta.CreatedAt, f)
 }
 
-func renderUpload(w http.ResponseWriter, msg string) {
+func renderUpload(w http.ResponseWriter, r *http.Request, msg string) {
 	render(w, pageData{
-		Title:  "Загрузка PDF",
-		Active: "upload",
-		Error:  msg,
+		Title:     "Загрузка PDF",
+		Active:    "upload",
+		Error:     msg,
+		CSRFToken: csrfToken(r),
 	})
 }
 
@@ -753,10 +780,11 @@ func renderLogin(w http.ResponseWriter, msg string) {
 	})
 }
 
-func renderDelete(w http.ResponseWriter) {
+func renderDelete(w http.ResponseWriter, r *http.Request) {
 	render(w, pageData{
-		Title:  "Удалить",
-		Active: "delete",
+		Title:     "Удалить",
+		Active:    "delete",
+		CSRFToken: csrfToken(r),
 	})
 }
 
@@ -790,10 +818,11 @@ func renderUploaded(w http.ResponseWriter, r *http.Request) {
 	}
 
 	render(w, pageData{
-		Title:  "Загруженные",
-		Active: "uploaded",
-		Query:  query,
-		Files:  files,
+		Title:     "Загруженные",
+		Active:    "uploaded",
+		Query:     query,
+		Files:     files,
+		CSRFToken: csrfToken(r),
 	})
 }
 
@@ -1087,11 +1116,26 @@ func normalizeLinkPath(id, linkPath string) string {
 }
 
 func baseURL(r *http.Request) string {
+	if configured := configuredBaseURL(); configured != "" {
+		return configured
+	}
+
 	scheme := "http"
 	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host
+}
+
+func configuredBaseURL() string {
+	baseURL := strings.TrimSpace(os.Getenv("APP_BASE_URL"))
+	if baseURL == "" {
+		return ""
+	}
+	if !strings.HasPrefix(strings.ToLower(baseURL), "http://") && !strings.HasPrefix(strings.ToLower(baseURL), "https://") {
+		baseURL = "https://" + baseURL
+	}
+	return strings.TrimRight(baseURL, "/")
 }
 
 func styles(w http.ResponseWriter, _ *http.Request) {
@@ -1110,6 +1154,14 @@ func must(err error) {
 	}
 }
 
+func mustRandomKey() [32]byte {
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		log.Fatalf("generate csrf key: %v", err)
+	}
+	return key
+}
+
 func isReadMethod(method string) bool {
 	return method == http.MethodGet || method == http.MethodHead
 }
@@ -1122,12 +1174,46 @@ func requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+func requireCSRF(w http.ResponseWriter, r *http.Request) bool {
+	if validCSRF(r) {
+		return true
+	}
+	http.Error(w, "forbidden", http.StatusForbidden)
+	return false
+}
+
 func isAuthenticated(r *http.Request) bool {
 	cookie, err := r.Cookie(sessionCookie)
 	if err != nil {
 		return false
 	}
 	return sessions.valid(cookie.Value)
+}
+
+func csrfToken(r *http.Request) string {
+	cookie, err := r.Cookie(sessionCookie)
+	if err != nil || !sessions.valid(cookie.Value) {
+		return ""
+	}
+	return csrfTokenForSession(cookie.Value)
+}
+
+func validCSRF(r *http.Request) bool {
+	got := strings.TrimSpace(r.URL.Query().Get("csrf_token"))
+	if got == "" {
+		got = strings.TrimSpace(r.Header.Get("X-CSRF-Token"))
+	}
+	want := csrfToken(r)
+	if got == "" || want == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func csrfTokenForSession(sessionToken string) string {
+	mac := hmac.New(sha256.New, csrfKey[:])
+	mac.Write([]byte(sessionToken))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -1825,8 +1911,12 @@ func buildWorksheetXML(metas []fileMeta) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
 	b.WriteString(`<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>`)
+	b.WriteString(`<row r="1">`)
+	writeInlineCell(&b, "A", 1, "Название")
+	writeInlineCell(&b, "B", 1, "Код")
+	b.WriteString(`</row>`)
 	for i, meta := range metas {
-		row := i + 1
+		row := i + 2
 		b.WriteString(fmt.Sprintf(`<row r="%d">`, row))
 		writeInlineCell(&b, "A", row, nameWithoutPDF(meta.OriginalName))
 		writeInlineCell(&b, "B", row, meta.ID)
@@ -1894,11 +1984,18 @@ func readXLSXFirstColumn(data []byte) ([]string, error) {
 			return nil, err
 		}
 		value = strings.TrimSpace(value)
+		if isFirstColumnHeader(ref, value) {
+			continue
+		}
 		if value != "" {
 			names = append(names, value)
 		}
 	}
 	return names, nil
+}
+
+func isFirstColumnHeader(ref, value string) bool {
+	return strings.EqualFold(ref, "A1") && strings.EqualFold(value, "Название")
 }
 
 func readXLSXSharedStrings(zr *zip.Reader) ([]string, error) {
@@ -2058,6 +2155,7 @@ const js = `(() => {
     const progressPercent = document.querySelector("[data-progress-percent]");
     const progressBar = document.querySelector("[data-progress-bar]");
     const progressMessage = document.querySelector("[data-progress-message]");
+    const csrfToken = document.querySelector("meta[name=csrf-token]")?.content || "";
 
     const showProgress = (title, percent, message) => {
         if (!progress) {
@@ -2073,6 +2171,14 @@ const js = `(() => {
     const wsURL = (path) => {
         const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
         return scheme + "//" + window.location.host + path;
+    };
+
+    const withCSRF = (path) => {
+        if (!csrfToken) {
+            return path;
+        }
+        const separator = path.includes("?") ? "&" : "?";
+        return path + separator + "csrf_token=" + encodeURIComponent(csrfToken);
     };
 
     const handleProgressMessage = (event, fallbackTitle) => {
@@ -2150,7 +2256,7 @@ const js = `(() => {
             exportButton.textContent = "Выгрузка...";
             showProgress("Выгрузка XLSX", 0, "Начинаем...");
 
-            const socket = new WebSocket(wsURL("/ws/uploads.xlsx"));
+            const socket = new WebSocket(wsURL(withCSRF("/ws/uploads.xlsx")));
             socket.binaryType = "arraybuffer";
 
             socket.onmessage = (event) => {
@@ -2198,7 +2304,7 @@ const js = `(() => {
             button.textContent = "Удаление...";
             showProgress("Удаление по XLSX", 0, "Подключаемся...");
 
-            const socket = new WebSocket(wsURL("/ws/delete.xlsx"));
+            const socket = new WebSocket(wsURL(withCSRF("/ws/delete.xlsx")));
             socket.binaryType = "arraybuffer";
 
             socket.onopen = () => {

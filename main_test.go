@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"io"
+	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -38,11 +40,104 @@ func TestBuildUploadsXLSX(t *testing.T) {
 	}
 
 	worksheet := readZipFile(t, zr, "xl/worksheets/sheet1.xml")
+	if !strings.Contains(worksheet, ">Название<") {
+		t.Fatalf("worksheet does not contain name header: %s", worksheet)
+	}
+	if !strings.Contains(worksheet, ">Код<") {
+		t.Fatalf("worksheet does not contain code header: %s", worksheet)
+	}
 	if !strings.Contains(worksheet, ">report<") {
 		t.Fatalf("worksheet does not contain PDF name without extension: %s", worksheet)
 	}
 	if !strings.Contains(worksheet, ">a1b2c<") {
 		t.Fatalf("worksheet does not contain public ID: %s", worksheet)
+	}
+}
+
+func TestZipPDFEntriesFindsNestedPDFs(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, name := range []string{
+		"root.pdf",
+		"level-1/level-2/level-3/deep.pdf",
+		"level-1/not-pdf.txt",
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("create zip entry %s: %v", name, err)
+		}
+		if _, err := w.Write([]byte("%PDF test")); err != nil {
+			t.Fatalf("write zip entry %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+
+	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("read zip: %v", err)
+	}
+
+	files := zipPDFEntries(zr.File)
+	if len(files) != 2 {
+		t.Fatalf("zipPDFEntries() length = %d, want 2", len(files))
+	}
+	if files[0].Name != "root.pdf" || files[1].Name != "level-1/level-2/level-3/deep.pdf" {
+		t.Fatalf("zipPDFEntries() = [%s, %s], want nested PDFs", files[0].Name, files[1].Name)
+	}
+}
+
+func TestPublicURLUsesConfiguredBaseURL(t *testing.T) {
+	t.Setenv("APP_BASE_URL", "https://example.com/")
+
+	got := publicURL(&http.Request{Host: "localhost:8010"}, fileMeta{ID: "a1b2c"})
+	want := "https://example.com/a1b2c"
+	if got != want {
+		t.Fatalf("publicURL() = %q, want %q", got, want)
+	}
+}
+
+func TestPublicURLAddsSchemeToConfiguredHost(t *testing.T) {
+	t.Setenv("APP_BASE_URL", "example.com/")
+
+	got := publicURL(&http.Request{Host: "localhost:8010"}, fileMeta{ID: "a1b2c"})
+	want := "https://example.com/a1b2c"
+	if got != want {
+		t.Fatalf("publicURL() = %q, want %q", got, want)
+	}
+}
+
+func TestPublicURLFallsBackToRequestHost(t *testing.T) {
+	t.Setenv("APP_BASE_URL", "")
+
+	got := publicURL(&http.Request{Host: "localhost:8010"}, fileMeta{ID: "a1b2c"})
+	want := "http://localhost:8010/a1b2c"
+	if got != want {
+		t.Fatalf("publicURL() = %q, want %q", got, want)
+	}
+}
+
+func TestValidCSRFRequiresSessionToken(t *testing.T) {
+	const sessionToken = "test-session"
+	sessions.set(sessionToken)
+	defer sessions.delete(sessionToken)
+
+	req := &http.Request{URL: &url.URL{}, Header: http.Header{}}
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sessionToken})
+	token := csrfToken(req)
+	if token == "" {
+		t.Fatal("csrfToken() returned empty token")
+	}
+
+	req.URL.RawQuery = "csrf_token=" + url.QueryEscape(token)
+	if !validCSRF(req) {
+		t.Fatal("validCSRF() rejected valid token")
+	}
+
+	req.URL.RawQuery = "csrf_token=bad"
+	if validCSRF(req) {
+		t.Fatal("validCSRF() accepted invalid token")
 	}
 }
 
