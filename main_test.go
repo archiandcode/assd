@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -27,8 +28,9 @@ func TestRandomPublicID(t *testing.T) {
 }
 
 func TestBuildUploadsXLSX(t *testing.T) {
+	createdAt := time.Date(2026, 5, 25, 14, 30, 0, 0, time.Local)
 	data, err := buildUploadsXLSX([]fileMeta{
-		{ID: "a1b2c", OriginalName: "report.pdf", CreatedAt: time.Now()},
+		{ID: "a1b2c", OriginalName: "report.pdf", CreatedAt: createdAt},
 	})
 	if err != nil {
 		t.Fatalf("buildUploadsXLSX() error = %v", err)
@@ -46,11 +48,36 @@ func TestBuildUploadsXLSX(t *testing.T) {
 	if !strings.Contains(worksheet, ">Код<") {
 		t.Fatalf("worksheet does not contain code header: %s", worksheet)
 	}
+	if !strings.Contains(worksheet, ">Ссылка<") {
+		t.Fatalf("worksheet does not contain link header: %s", worksheet)
+	}
+	if !strings.Contains(worksheet, ">Дата добавления<") {
+		t.Fatalf("worksheet does not contain created date header: %s", worksheet)
+	}
 	if !strings.Contains(worksheet, ">report<") {
 		t.Fatalf("worksheet does not contain PDF name without extension: %s", worksheet)
 	}
 	if !strings.Contains(worksheet, ">a1b2c<") {
 		t.Fatalf("worksheet does not contain public ID: %s", worksheet)
+	}
+	if !strings.Contains(worksheet, ">/a1b2c<") {
+		t.Fatalf("worksheet does not contain public link: %s", worksheet)
+	}
+	if !strings.Contains(worksheet, ">2026-05-25 14:30<") {
+		t.Fatalf("worksheet does not contain created date: %s", worksheet)
+	}
+}
+
+func TestSortUploadsForExportNewestFirst(t *testing.T) {
+	metas := []fileMeta{
+		{ID: "old01", OriginalName: "old.pdf", CreatedAt: time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)},
+		{ID: "new01", OriginalName: "new.pdf", CreatedAt: time.Date(2026, 5, 25, 10, 0, 0, 0, time.UTC)},
+	}
+
+	sortUploadsForExport(metas)
+
+	if metas[0].ID != "new01" || metas[1].ID != "old01" {
+		t.Fatalf("sortUploadsForExport order = [%s, %s], want newest first", metas[0].ID, metas[1].ID)
 	}
 }
 
@@ -141,6 +168,20 @@ func TestValidCSRFRequiresSessionToken(t *testing.T) {
 	}
 }
 
+func TestNotFoundShowsPageDoesNotExist(t *testing.T) {
+	rec := httptest.NewRecorder()
+
+	notFound(rec)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("notFound() status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Страница не существует") {
+		t.Fatalf("notFound() body does not contain page message: %s", body)
+	}
+}
+
 func TestReadXLSXFirstColumn(t *testing.T) {
 	data, err := buildUploadsXLSX([]fileMeta{
 		{ID: "a1b2c", OriginalName: "report.pdf", CreatedAt: time.Now()},
@@ -163,6 +204,51 @@ func TestReadXLSXFirstColumn(t *testing.T) {
 		if names[i] != want[i] {
 			t.Fatalf("readXLSXFirstColumn()[%d] = %q, want %q", i, names[i], want[i])
 		}
+	}
+}
+
+func TestReadXLSXDeleteIDsUsesLinksOrCodes(t *testing.T) {
+	data, err := buildUploadsXLSX([]fileMeta{
+		{ID: "a1b2c", OriginalName: "report.pdf", LinkPath: "/a1b2c", CreatedAt: time.Now()},
+		{ID: "d4e5f", OriginalName: "invoice.pdf", LinkPath: "/d4e5f", CreatedAt: time.Now()},
+	})
+	if err != nil {
+		t.Fatalf("buildUploadsXLSX() error = %v", err)
+	}
+
+	ids, err := readXLSXDeleteIDs(data)
+	if err != nil {
+		t.Fatalf("readXLSXDeleteIDs() error = %v", err)
+	}
+
+	want := []string{"a1b2c", "d4e5f"}
+	if len(ids) != len(want) {
+		t.Fatalf("readXLSXDeleteIDs() length = %d, want %d (%v)", len(ids), len(want), ids)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("readXLSXDeleteIDs()[%d] = %q, want %q", i, ids[i], want[i])
+		}
+	}
+}
+
+func TestPublicIDFromLinkOrCode(t *testing.T) {
+	tests := map[string]string{
+		"a1b2c":                            "a1b2c",
+		"/a1b2c":                           "a1b2c",
+		"https://example.com/a1b2c":        "a1b2c",
+		"https://example.com/a1b2c/inline": "a1b2c",
+		"https://example.com/p/a1b2c":      "a1b2c",
+	}
+	for input, want := range tests {
+		got, ok := publicIDFromLinkOrCode(input)
+		if !ok || got != want {
+			t.Fatalf("publicIDFromLinkOrCode(%q) = %q, %v, want %q, true", input, got, ok, want)
+		}
+	}
+
+	if got, ok := publicIDFromLinkOrCode("report.pdf"); ok {
+		t.Fatalf("publicIDFromLinkOrCode(report.pdf) = %q, true, want false", got)
 	}
 }
 

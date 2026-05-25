@@ -72,6 +72,7 @@ type pageData struct {
 	Error     string
 	Query     string
 	Login     bool
+	NotFound  bool
 	Uploads   []uploadLink
 	Files     []uploadedFile
 	FileName  string
@@ -128,7 +129,15 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 </head>
 <body>
 	<main class="page{{if .Wide}} page-public{{end}}">
-		{{if .Login}}
+		{{if .NotFound}}
+			<section class="not-found-screen">
+				<div class="not-found-panel">
+					<p>404</p>
+					<h1>Страница не существует</h1>
+					<a class="btn btn-primary" href="/">На главную</a>
+				</div>
+			</section>
+		{{else if .Login}}
 			<section class="login-screen">
 				<div class="login-panel">
 					<div class="login-heading">
@@ -291,9 +300,9 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 						<div class="card tools-card">
 							<form class="form" data-delete-form>
 								<div class="field">
-									<label for="delete-xlsx">XLSX с названиями файлов</label>
+									<label for="delete-xlsx">XLSX со ссылками</label>
 									<input id="delete-xlsx" name="delete-xlsx" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
-									<p class="help">В первой колонке должны быть названия файлов без расширения или с .pdf.</p>
+									<p class="help">В XLSX должна быть колонка "Ссылка" или "Код". Если заголовков нет, укажите ссылки или коды в первой колонке.</p>
 								</div>
 								<div class="form-actions">
 									<button class="btn btn-primary" type="submit">Удалить найденные</button>
@@ -840,9 +849,7 @@ func exportUploadsXLSX(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = conn.writeProgress("export", 35, "Сортируем данные...")
-	sort.Slice(metas, func(i, j int) bool {
-		return nameWithoutPDF(metas[i].OriginalName) < nameWithoutPDF(metas[j].OriginalName)
-	})
+	sortUploadsForExport(metas)
 
 	_ = conn.writeProgress("export", 65, "Формируем XLSX...")
 	xlsx, err := buildUploadsXLSX(metas)
@@ -856,6 +863,12 @@ func exportUploadsXLSX(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = conn.writeProgress("export", 100, "Готово.")
 	_ = conn.writeClose("")
+}
+
+func sortUploadsForExport(metas []fileMeta) {
+	sort.Slice(metas, func(i, j int) bool {
+		return metas[i].CreatedAt.After(metas[j].CreatedAt)
+	})
 }
 
 func deleteUploadsXLSX(w http.ResponseWriter, r *http.Request) {
@@ -872,14 +885,14 @@ func deleteUploadsXLSX(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = conn.writeProgress("delete", 20, "Читаем названия из первой колонки...")
-	names, err := readXLSXFirstColumn(data)
+	_ = conn.writeProgress("delete", 20, "Читаем ссылки из XLSX...")
+	ids, err := readXLSXDeleteIDs(data)
 	if err != nil {
 		_ = conn.writeClose("cannot parse xlsx")
 		return
 	}
-	if len(names) == 0 {
-		_ = conn.writeClose("xlsx has no names")
+	if len(ids) == 0 {
+		_ = conn.writeClose("xlsx has no links")
 		return
 	}
 
@@ -891,14 +904,14 @@ func deleteUploadsXLSX(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wanted := map[string]bool{}
-	for _, name := range names {
-		wanted[normalizeFileTitle(name)] = true
+	for _, id := range ids {
+		wanted[id] = true
 	}
 
 	deleted := 0
 	total := len(metas)
 	for i, meta := range metas {
-		if wanted[normalizeFileTitle(meta.OriginalName)] || wanted[normalizeFileTitle(nameWithoutPDF(meta.OriginalName))] {
+		if wanted[meta.ID] {
 			if err := deleteMeta(meta); err != nil {
 				_ = conn.writeClose("cannot delete files")
 				return
@@ -917,15 +930,19 @@ func deleteUploadsXLSX(w http.ResponseWriter, r *http.Request) {
 }
 
 func render(w http.ResponseWriter, data pageData) {
+	renderStatus(w, http.StatusOK, data)
+}
+
+func renderStatus(w http.ResponseWriter, status int, data pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
 	if err := page.Execute(w, data); err != nil {
 		log.Printf("render error: %v", err)
 	}
 }
 
 func notFound(w http.ResponseWriter) {
-	w.WriteHeader(http.StatusNotFound)
-	render(w, pageData{Title: "Файл не найден", Error: "PDF по этой ссылке не найден."})
+	renderStatus(w, http.StatusNotFound, pageData{Title: "Страница не существует", NotFound: true})
 }
 
 func saveMeta(meta fileMeta) error {
@@ -1914,16 +1931,27 @@ func buildWorksheetXML(metas []fileMeta) string {
 	b.WriteString(`<row r="1">`)
 	writeInlineCell(&b, "A", 1, "Название")
 	writeInlineCell(&b, "B", 1, "Код")
+	writeInlineCell(&b, "C", 1, "Ссылка")
+	writeInlineCell(&b, "D", 1, "Дата добавления")
 	b.WriteString(`</row>`)
 	for i, meta := range metas {
 		row := i + 2
 		b.WriteString(fmt.Sprintf(`<row r="%d">`, row))
 		writeInlineCell(&b, "A", row, nameWithoutPDF(meta.OriginalName))
 		writeInlineCell(&b, "B", row, meta.ID)
+		writeInlineCell(&b, "C", row, normalizeLinkPath(meta.ID, meta.LinkPath))
+		writeInlineCell(&b, "D", row, formatCreatedAtForXLSX(meta.CreatedAt))
 		b.WriteString(`</row>`)
 	}
 	b.WriteString(`</sheetData></worksheet>`)
 	return b.String()
+}
+
+func formatCreatedAtForXLSX(createdAt time.Time) string {
+	if createdAt.IsZero() {
+		return ""
+	}
+	return createdAt.Local().Format("2006-01-02 15:04")
 }
 
 func nameWithoutPDF(name string) string {
@@ -1941,6 +1969,105 @@ func normalizeFileTitle(name string) string {
 }
 
 func readXLSXFirstColumn(data []byte) ([]string, error) {
+	rows, err := readXLSXRows(data)
+	if err != nil {
+		return nil, err
+	}
+
+	var names []string
+	for i, row := range rows {
+		value := strings.TrimSpace(row["A"])
+		if i == 0 && strings.EqualFold(value, "Название") {
+			continue
+		}
+		if value != "" {
+			names = append(names, value)
+		}
+	}
+	return names, nil
+}
+
+func readXLSXDeleteIDs(data []byte) ([]string, error) {
+	rows, err := readXLSXRows(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	column := deleteIDColumn(rows[0])
+	start := 0
+	if column != "" {
+		start = 1
+	} else {
+		column = "A"
+	}
+
+	seen := map[string]bool{}
+	var ids []string
+	for _, row := range rows[start:] {
+		id, ok := publicIDFromLinkOrCode(row[column])
+		if !ok || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func deleteIDColumn(header map[string]string) string {
+	for _, col := range []string{"C", "B", "A"} {
+		value := strings.TrimSpace(header[col])
+		if strings.EqualFold(value, "Ссылка") || strings.EqualFold(value, "Код") {
+			return col
+		}
+	}
+	return ""
+}
+
+func publicIDFromLinkOrCode(value string) (string, bool) {
+	value = strings.TrimSpace(strings.TrimPrefix(value, "\ufeff"))
+	if value == "" {
+		return "", false
+	}
+	if validDeletePublicID(value) {
+		return value, true
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", false
+	}
+	path := strings.Trim(parsed.EscapedPath(), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		return "", false
+	}
+	if parts[0] == "p" && len(parts) > 1 {
+		parts = parts[1:]
+	}
+	id, err := url.PathUnescape(parts[0])
+	if err != nil || !validDeletePublicID(id) {
+		return "", false
+	}
+	return id, true
+}
+
+func validDeletePublicID(id string) bool {
+	if len(id) != publicIDLength {
+		return false
+	}
+	for _, r := range id {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func readXLSXRows(data []byte) ([]map[string]string, error) {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return nil, err
@@ -1957,7 +2084,8 @@ func readXLSXFirstColumn(data []byte) ([]string, error) {
 	}
 
 	decoder := xml.NewDecoder(strings.NewReader(sheet))
-	var names []string
+	rowsByIndex := map[int]map[string]string{}
+	var rowNumbers []int
 	for {
 		token, err := decoder.Token()
 		if errors.Is(err, io.EOF) {
@@ -1972,30 +2100,29 @@ func readXLSXFirstColumn(data []byte) ([]string, error) {
 		}
 
 		ref := xmlAttr(start, "r")
-		if ref != "" && cellColumn(ref) != "A" {
-			if err := skipXMLCell(decoder); err != nil {
-				return nil, err
-			}
-			continue
-		}
+		col := cellColumn(ref)
+		row := cellRow(ref)
 
 		value, err := readXLSXCell(decoder, xmlAttr(start, "t"), shared)
 		if err != nil {
 			return nil, err
 		}
 		value = strings.TrimSpace(value)
-		if isFirstColumnHeader(ref, value) {
+		if col == "" || row == 0 || value == "" {
 			continue
 		}
-		if value != "" {
-			names = append(names, value)
+		if rowsByIndex[row] == nil {
+			rowsByIndex[row] = map[string]string{}
+			rowNumbers = append(rowNumbers, row)
 		}
+		rowsByIndex[row][col] = value
 	}
-	return names, nil
-}
-
-func isFirstColumnHeader(ref, value string) bool {
-	return strings.EqualFold(ref, "A1") && strings.EqualFold(value, "Название")
+	sort.Ints(rowNumbers)
+	rows := make([]map[string]string, 0, len(rowNumbers))
+	for _, row := range rowNumbers {
+		rows = append(rows, rowsByIndex[row])
+	}
+	return rows, nil
 }
 
 func readXLSXSharedStrings(zr *zip.Reader) ([]string, error) {
@@ -2141,6 +2268,17 @@ func cellColumn(ref string) string {
 		b.WriteRune(r)
 	}
 	return b.String()
+}
+
+func cellRow(ref string) int {
+	var row int
+	for _, r := range ref {
+		if r < '0' || r > '9' {
+			continue
+		}
+		row = row*10 + int(r-'0')
+	}
+	return row
 }
 
 func writeInlineCell(b *strings.Builder, col string, row int, value string) {
@@ -2490,6 +2628,32 @@ a {
     background: var(--surface);
     padding: 28px;
     box-shadow: 0 14px 40px rgba(15, 23, 42, 0.08);
+}
+
+.not-found-screen {
+    display: grid;
+    min-height: 100vh;
+    place-items: center;
+    padding: 24px;
+}
+
+.not-found-panel {
+    width: min(100%, 460px);
+    text-align: center;
+}
+
+.not-found-panel p {
+    margin: 0 0 10px;
+    color: var(--muted);
+    font-size: 14px;
+    font-weight: 700;
+}
+
+.not-found-panel h1 {
+    margin: 0 0 22px;
+    color: #111827;
+    font-size: 30px;
+    line-height: 1.2;
 }
 
 .login-heading {
