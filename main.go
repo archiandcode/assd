@@ -134,7 +134,6 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 				<div class="not-found-panel">
 					<p>404</p>
 					<h1>Страница не существует</h1>
-					<a class="btn btn-primary" href="/">На главную</a>
 				</div>
 			</section>
 		{{else if .Login}}
