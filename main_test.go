@@ -48,11 +48,11 @@ func TestBuildUploadsXLSX(t *testing.T) {
 	if !strings.Contains(worksheet, ">Код<") {
 		t.Fatalf("worksheet does not contain code header: %s", worksheet)
 	}
-	if !strings.Contains(worksheet, ">Ссылка<") {
-		t.Fatalf("worksheet does not contain link header: %s", worksheet)
-	}
 	if !strings.Contains(worksheet, ">Дата добавления<") {
 		t.Fatalf("worksheet does not contain created date header: %s", worksheet)
+	}
+	if strings.Contains(worksheet, ">Ссылка<") {
+		t.Fatalf("worksheet contains unexpected link header: %s", worksheet)
 	}
 	if !strings.Contains(worksheet, ">report<") {
 		t.Fatalf("worksheet does not contain PDF name without extension: %s", worksheet)
@@ -60,10 +60,10 @@ func TestBuildUploadsXLSX(t *testing.T) {
 	if !strings.Contains(worksheet, ">a1b2c<") {
 		t.Fatalf("worksheet does not contain public ID: %s", worksheet)
 	}
-	if !strings.Contains(worksheet, ">/a1b2c<") {
-		t.Fatalf("worksheet does not contain public link: %s", worksheet)
+	if strings.Contains(worksheet, ">/a1b2c<") {
+		t.Fatalf("worksheet contains unexpected public link: %s", worksheet)
 	}
-	if !strings.Contains(worksheet, ">2026-05-25 14:30<") {
+	if !strings.Contains(worksheet, ">14:30 25.05.2026<") {
 		t.Fatalf("worksheet does not contain created date: %s", worksheet)
 	}
 }

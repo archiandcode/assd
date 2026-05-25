@@ -1930,16 +1930,14 @@ func buildWorksheetXML(metas []fileMeta) string {
 	b.WriteString(`<row r="1">`)
 	writeInlineCell(&b, "A", 1, "Название")
 	writeInlineCell(&b, "B", 1, "Код")
-	writeInlineCell(&b, "C", 1, "Ссылка")
-	writeInlineCell(&b, "D", 1, "Дата добавления")
+	writeInlineCell(&b, "C", 1, "Дата добавления")
 	b.WriteString(`</row>`)
 	for i, meta := range metas {
 		row := i + 2
 		b.WriteString(fmt.Sprintf(`<row r="%d">`, row))
 		writeInlineCell(&b, "A", row, nameWithoutPDF(meta.OriginalName))
 		writeInlineCell(&b, "B", row, meta.ID)
-		writeInlineCell(&b, "C", row, normalizeLinkPath(meta.ID, meta.LinkPath))
-		writeInlineCell(&b, "D", row, formatCreatedAtForXLSX(meta.CreatedAt))
+		writeInlineCell(&b, "C", row, formatCreatedAtForXLSX(meta.CreatedAt))
 		b.WriteString(`</row>`)
 	}
 	b.WriteString(`</sheetData></worksheet>`)
@@ -1950,7 +1948,7 @@ func formatCreatedAtForXLSX(createdAt time.Time) string {
 	if createdAt.IsZero() {
 		return ""
 	}
-	return createdAt.Local().Format("2006-01-02 15:04")
+	return createdAt.Local().Format("15:04 02.01.2006")
 }
 
 func nameWithoutPDF(name string) string {
@@ -2017,7 +2015,7 @@ func readXLSXDeleteIDs(data []byte) ([]string, error) {
 }
 
 func deleteIDColumn(header map[string]string) string {
-	for _, col := range []string{"C", "B", "A"} {
+	for _, col := range []string{"B", "A", "C"} {
 		value := strings.TrimSpace(header[col])
 		if strings.EqualFold(value, "Ссылка") || strings.EqualFold(value, "Код") {
 			return col
