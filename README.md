@@ -27,6 +27,47 @@ docker compose run --rm app create-user admin 'change-this-password'
 
 После запуска откройте `http://localhost:8010`.
 
+## HTTPS через Nginx
+
+`docker-compose.yml` поднимает отдельный сервис `nginx`, который слушает
+`80` и `443`, редиректит HTTP на HTTPS и проксирует запросы в Go-приложение.
+Файлы сертификата должны лежать здесь:
+
+```text
+nginx/certs/fullchain.pem
+nginx/certs/privkey.pem
+```
+
+Для локального запуска можно создать self-signed сертификат:
+
+```bash
+mkdir -p nginx/certs
+openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+  -keyout nginx/certs/privkey.pem \
+  -out nginx/certs/fullchain.pem \
+  -subj '/CN=localhost'
+```
+
+После этого запустите:
+
+```bash
+docker compose up -d --build
+```
+
+Откройте `https://localhost`. Для боевого домена замените файлы в
+`nginx/certs` на сертификат и приватный ключ от домена и задайте публичный
+адрес в `.env`:
+
+```env
+APP_BASE_URL=https://example.com
+```
+
+Если локально заняты порты `80` или `443`, задайте другие порты:
+
+```bash
+HTTP_PORT=8080 HTTPS_PORT=8443 docker compose up -d --build
+```
+
 Для запуска без Docker можно поднять только PostgreSQL:
 
 ```bash
@@ -67,6 +108,10 @@ PORT=8011 go run .
 websocket; первая колонка содержит имя PDF без расширения `.pdf`, вторая -
 5-символьный код ссылки.
 
-Файлы сохраняются в `storage/files`, метаданные - в `storage/meta`,
-пользователи авторизации - в PostgreSQL. Таблица пользователей создается
-миграцией из `migrations`.
+Файлы сохраняются в папке проекта `storage/files`, метаданные - в
+`storage/meta`. В Docker эта папка подключена как `./storage:/app/storage`,
+поэтому загруженные PDF не пропадают при пересоздании контейнера и их проще
+бэкапить. Контейнер приложения пишет в нее от пользователя `1000:1000` по
+умолчанию; при необходимости задайте `APP_UID` и `APP_GID` в `.env`.
+Пользователи авторизации хранятся в PostgreSQL. Таблица пользователей
+создается миграцией из `migrations`.
