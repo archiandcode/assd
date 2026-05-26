@@ -25,48 +25,42 @@ docker compose up -d --build
 docker compose run --rm app create-user admin 'change-this-password'
 ```
 
-После запуска откройте `http://localhost:8010`.
+После запуска откройте `http://localhost:8010`. В Docker Compose приложение
+публикуется только на `127.0.0.1:8010`, чтобы его мог читать локальный Nginx
+на сервере, но порт не был доступен извне.
 
-## HTTPS через Nginx
+## Nginx на сервере
 
-`docker-compose.yml` поднимает отдельный сервис `nginx`, который слушает
-`80` и `443`, редиректит HTTP на HTTPS и проксирует запросы в Go-приложение.
-Файлы сертификата должны лежать здесь:
-
-```text
-nginx/certs/fullchain.pem
-nginx/certs/privkey.pem
-```
-
-Для локального запуска можно создать self-signed сертификат:
-
-```bash
-mkdir -p nginx/certs
-openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
-  -keyout nginx/certs/privkey.pem \
-  -out nginx/certs/fullchain.pem \
-  -subj '/CN=localhost'
-```
-
-После этого запустите:
-
-```bash
-docker compose up -d --build
-```
-
-Откройте `https://localhost`. Для боевого домена замените файлы в
-`nginx/certs` на сертификат и приватный ключ от домена и задайте публичный
-адрес в `.env`:
+В проекте нет отдельного Docker-контейнера Nginx. HTTPS и сертификаты
+настраиваются в системном Nginx на сервере. Для боевого домена задайте
+публичный адрес в `.env`:
 
 ```env
 APP_BASE_URL=https://example.com
 ```
 
-Если локально заняты порты `80` или `443`, задайте другие порты:
+Минимальный server block для системного Nginx:
 
-```bash
-HTTP_PORT=8080 HTTPS_PORT=8443 docker compose up -d --build
+```nginx
+server {
+    listen 80;
+    server_name example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8010;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
 ```
+
+После выпуска HTTPS-сертификата Certbot обычно сам добавляет SSL-настройки
+в системный Nginx.
 
 Для запуска без Docker можно поднять только PostgreSQL:
 
