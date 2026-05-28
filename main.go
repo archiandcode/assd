@@ -166,8 +166,8 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 				<div class="public-pdf-actions">
 					<a class="btn btn-primary" href="/{{.ID}}/download">Скачать PDF</a>
 				</div>
-				<div class="pdf-viewer">
-					<iframe title="{{.FileName}}" src="/{{.ID}}/inline#toolbar=0&navpanes=0&view=FitH"></iframe>
+				<div class="pdf-viewer" data-pdf-viewer data-pdf-url="/{{.ID}}/inline">
+					<div class="pdf-status" data-pdf-status>Загрузка PDF...</div>
 				</div>
 			</section>
 		{{else}}
@@ -331,6 +331,7 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 			</div>
 		{{end}}
 	</main>
+	{{if .ID}}<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>{{end}}
 	<script src="/assets/export.js"></script>
 </body>
 </html>`))
@@ -690,7 +691,12 @@ func handlePDF(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 1 {
-		servePDF(w, r, meta, false)
+		render(w, pageData{
+			Title:    meta.OriginalName,
+			FileName: meta.OriginalName,
+			ID:       url.PathEscape(meta.ID),
+			Wide:     true,
+		})
 		return
 	}
 
@@ -1229,7 +1235,7 @@ func csrfTokenForSession(sessionToken string) string {
 
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws: wss:; base-uri 'self'; object-src 'none'; frame-src 'self'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; connect-src 'self' ws: wss:; worker-src 'self' blob: https://cdn.jsdelivr.net; base-uri 'self'; object-src 'none'; frame-src 'self'; form-action 'self'")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -2280,6 +2286,59 @@ func writeInlineCell(b *strings.Builder, col string, row int, value string) {
 }
 
 const js = `(() => {
+    const pdfViewer = document.querySelector("[data-pdf-viewer]");
+    if (pdfViewer) {
+        const status = document.querySelector("[data-pdf-status]");
+        const setStatus = (message) => {
+            if (status) {
+                status.textContent = message;
+            }
+        };
+
+        const renderPDF = async () => {
+            if (!window.pdfjsLib) {
+                setStatus("Не удалось загрузить просмотрщик PDF.");
+                return;
+            }
+
+            const pdfURL = pdfViewer.dataset.pdfUrl;
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+
+            const pdf = await window.pdfjsLib.getDocument(pdfURL).promise;
+            setStatus("Страниц: " + pdf.numPages);
+
+            for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+                const page = await pdf.getPage(pageNumber);
+                const baseViewport = page.getViewport({ scale: 1 });
+                const availableWidth = Math.max(320, pdfViewer.clientWidth);
+                const scale = availableWidth / baseViewport.width;
+                const viewport = page.getViewport({ scale });
+                const outputScale = Math.min(window.devicePixelRatio || 1, 2);
+
+                const canvas = document.createElement("canvas");
+                canvas.className = "pdf-page";
+                canvas.width = Math.floor(viewport.width * outputScale);
+                canvas.height = Math.floor(viewport.height * outputScale);
+                canvas.style.width = Math.floor(viewport.width) + "px";
+                canvas.style.height = Math.floor(viewport.height) + "px";
+
+                const context = canvas.getContext("2d");
+                context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
+                pdfViewer.appendChild(canvas);
+
+                await page.render({ canvasContext: context, viewport }).promise;
+            }
+
+            if (status) {
+                status.remove();
+            }
+        };
+
+        renderPDF().catch(() => {
+            setStatus("Не удалось открыть PDF. Попробуйте скачать файл.");
+        });
+    }
+
     const progress = document.querySelector("[data-progress]");
     const progressTitle = document.querySelector("[data-progress-title]");
     const progressPercent = document.querySelector("[data-progress-percent]");
@@ -2938,18 +2997,27 @@ input:focus {
 .pdf-viewer {
     width: min(1120px, 100%);
     margin: 0 auto;
-    overflow: hidden;
+    display: grid;
+    justify-items: center;
+    gap: 14px;
+}
+
+.pdf-status {
+    width: 100%;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--surface);
-    box-shadow: 0 14px 36px rgba(15, 23, 42, 0.10);
+    color: var(--muted);
+    padding: 18px;
+    text-align: center;
 }
 
-.pdf-viewer iframe {
+.pdf-page {
     display: block;
-    width: 100%;
-    height: calc(100vh - 82px);
-    min-height: 620px;
-    border: 0;
+    max-width: 100%;
+    height: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
     background: var(--surface);
+    box-shadow: 0 10px 26px rgba(15, 23, 42, 0.10);
 }`
