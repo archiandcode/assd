@@ -2289,6 +2289,7 @@ const js = `(() => {
     const pdfViewer = document.querySelector("[data-pdf-viewer]");
     if (pdfViewer) {
         const status = document.querySelector("[data-pdf-status]");
+        let resizeTimer = 0;
         const setStatus = (message) => {
             if (status) {
                 status.textContent = message;
@@ -2306,6 +2307,7 @@ const js = `(() => {
 
             const pdf = await window.pdfjsLib.getDocument(pdfURL).promise;
             setStatus("Страниц: " + pdf.numPages);
+            pdfViewer.querySelectorAll(".pdf-page").forEach((page) => page.remove());
 
             for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
                 const page = await pdf.getPage(pageNumber);
@@ -2313,7 +2315,7 @@ const js = `(() => {
                 const availableWidth = Math.max(320, pdfViewer.clientWidth);
                 const scale = availableWidth / baseViewport.width;
                 const viewport = page.getViewport({ scale });
-                const outputScale = Math.min(window.devicePixelRatio || 1, 2);
+                const outputScale = Math.min(Math.max(window.devicePixelRatio || 1, 2) * 2, 4);
 
                 const canvas = document.createElement("canvas");
                 canvas.className = "pdf-page";
@@ -2336,6 +2338,15 @@ const js = `(() => {
 
         renderPDF().catch(() => {
             setStatus("Не удалось открыть PDF. Попробуйте скачать файл.");
+        });
+
+        window.addEventListener("resize", () => {
+            window.clearTimeout(resizeTimer);
+            resizeTimer = window.setTimeout(() => {
+                renderPDF().catch(() => {
+                    setStatus("Не удалось открыть PDF. Попробуйте скачать файл.");
+                });
+            }, 250);
         });
     }
 
