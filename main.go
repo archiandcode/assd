@@ -167,7 +167,7 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 					<a class="btn btn-primary" href="/{{.ID}}/download">Скачать PDF</a>
 				</div>
 				<div class="pdf-viewer">
-					<iframe title="{{.FileName}}" src="/{{.ID}}/inline#toolbar=0&navpanes=0&scrollbar=0&view=FitH"></iframe>
+					<iframe title="{{.FileName}}" src="/{{.ID}}/inline#toolbar=0&navpanes=0&view=FitH"></iframe>
 				</div>
 			</section>
 		{{else}}
@@ -690,12 +690,7 @@ func handlePDF(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 1 {
-		render(w, pageData{
-			Title:    meta.OriginalName,
-			FileName: meta.OriginalName,
-			ID:       url.PathEscape(meta.ID),
-			Wide:     true,
-		})
+		servePDF(w, r, meta, false)
 		return
 	}
 
